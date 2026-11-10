@@ -12,7 +12,7 @@ Built and validated against **Windows Server** in-place upgrades (2012 R2/2016/2
 See [Scope: Windows Server only (so far)](#scope-windows-server-only-so-far) below
 before pointing this at a Windows 11/client upgrade.
 
-![Report example: recommended next steps](docs/sample-recommendations.png)
+![Report example: IPU phase checklist and recommended next steps](docs/sample-recommendations.png)
 
 ## Two ways to run it
 
@@ -60,28 +60,37 @@ browser to see what a report looks like.)
 
 ## What the report tells you
 
-1. **Recommended next steps**: prioritized DO FIRST / NEXT / HYGIENE actions derived
+1. **IPU phase checklist**: which macro phase this run is in. Not a raw percentage:
+   Microsoft's own docs note that percentage only reaches 100% at the end of the
+   post-reboot work, so a stuck downlevel capture can show a misleadingly high number
+   while having no visibility into most of the upgrade. The checklist instead shows
+   **Downlevel** (done / in progress / stuck / failed here), **Post-reboot**
+   (First boot to Second boot/OOBE: done / stuck / not reached), and a conditional
+   **Rollback/Uninstall** row when a failure or cancellation was detected. See
+   [Phase checklist: how it's derived](#phase-checklist-how-its-derived) below.
+2. **Recommended next steps**: prioritized DO FIRST / NEXT / HYGIENE actions derived
    from the findings, not a generic checklist.
-2. **Attempts overview**: one row per attempt (window, duration, max %, longest
+3. **Attempts overview**: one row per attempt (window, duration, max %, longest
    stall, top migrated folder). Attempts are split on `SetupHost Logging Begin`.
-3. **Progress vs. time**: the global-progress % curve, extended flat through a stall
-   so "stuck at NN%" reads as one continuous line instead of blank space.
-4. **Hang vs. busy plateau**: a flat % is only called a **hang** when the log itself
+4. **Progress vs. time**: the global-progress % curve, extended flat through a stall
+   so "stuck at NN%" reads as one continuous line instead of blank space. Treat this
+   as supporting detail within a phase, not the headline "where are we" signal.
+5. **Hang vs. busy plateau**: a flat % is only called a **hang** when the log itself
    goes silent for 30+ minutes through it. Otherwise it's reported as *busy* (e.g.
    USMT still migrating files) with the longest-running operation called out.
-5. **Phase durations & longest operations**: from `Setup phase change:` markers and
+6. **Phase durations & longest operations**: from `Setup phase change:` markers and
    the SP operation table. Includes a synthetic bar for an offline-apply/migration
    op that never completes when the run is cancelled mid-way.
-6. **Finalize timing telemetry**: `CSetupDiagnostics … [*Time]=[0x..]` values (e.g.
+7. **Finalize timing telemetry**: `CSetupDiagnostics … [*Time]=[0x..]` values (e.g.
    `DriverMigrationTime` dominating = USMT file migration is the bottleneck).
-7. **Migrated-file hotspots**: `MIG … Processing File:` lines bucketed by folder.
+8. **Migrated-file hotspots**: `MIG … Processing File:` lines bucketed by folder.
    `C:\Windows\SystemTemp` dominating is the classic multi-hour cause: USMT looping
    millions of tiny temp files one at a time.
-8. **USMT migration breakdown** (`--miglog`, opt-in; `MigLog.xml` can be 300 MB+):
+9. **USMT migration breakdown** (`--miglog`, opt-in; `MigLog.xml` can be 300 MB+):
    migrated units by group/role/agent and migration-plugin action counts.
-9. **Online/new-OS phase**: distinguishes an offline-applied specialize phase
-   (labeled explicitly as *not* a real reboot) from a true post-reboot first boot.
-10. **Outcome**: the final result code with a plain-English explanation, plus
+10. **Online/new-OS phase**: distinguishes an offline-applied specialize phase
+    (labeled explicitly as *not* a real reboot) from a true post-reboot first boot.
+11. **Outcome**: the final result code with a plain-English explanation, plus
     SetupDiag's failing operation. It also includes a **compatibility hard-block
     panel** (parsed from `ScanResult.xml`; e.g. a domain controller missing
     `ADPREP /DOMAINPREP`, with targeted remediation), a **migration-plugin
@@ -89,10 +98,28 @@ browser to see what a report looks like.)
     the generic wrapper error code that follows it), and an intentionally honest
     **CBS corruption assessment** (NOISE / RELEVANT / BLOCKER). It will not
     overstate corruption as *the* cause from logs alone.
-11. **Which logs to check**: a short IPU log cheat-sheet.
-12. **No-IPU / incomplete-capture detection**: if the logs show no in-place upgrade
+12. **Which logs to check**: a short IPU log cheat-sheet.
+13. **No-IPU / incomplete-capture detection**: if the logs show no in-place upgrade
     ever ran, or the capture was cut off mid-write (a long run of NUL padding at EOF),
     the report says so plainly instead of guessing or fabricating a final result.
+
+## Phase checklist: how it's derived
+
+`ipu_analyze.py` only ever sees up to two log sources: the pre-reboot **downlevel**
+capture and, if present, the post-reboot **online/new-OS** capture. That's enough to
+tell apart two macro phases reliably, but not enough to split Safe OS from First boot
+from Second boot/OOBE on its own. The checklist is intentionally conservative about
+that: it reports **Downlevel** and **Post-reboot (First boot to Second boot/OOBE)** as
+two rows, plus a conditional **Rollback/Uninstall** row when a failure or cancellation
+was detected (Windows Setup automatically reverts to the previous OS when an attempt
+doesn't finish).
+
+For the full, finer-grained phase model Windows Setup actually uses internally, see:
+
+- [Windows 10 upgrade issues troubleshooting](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/windows-10-upgrade-issues-troubleshooting), which names the phases: Downlevel, Safe OS, First boot, Second boot (OOBE), and Uninstall if the upgrade fails. It also states plainly that the displayed percentage "reach[es] 100% at the end of the second boot phase," not when the upgrade is actually done.
+- [Windows 10 upgrade error codes](https://learn.microsoft.com/en-us/troubleshoot/windows-client/deployment/windows-10-upgrade-error-codes), which documents the numbered `SP_EXECUTION_*` phase enum (`DOWNLEVEL`, `SAFE_OS`, `FIRST_BOOT`, `OOBE_BOOT`, `UNINSTALL`) encoded in Windows Setup's "extend codes."
+- [Windows Server KB: "0x80070003" during Process Drivers for Migration](https://learn.microsoft.com/en-us/troubleshoot/windows-server/setup-upgrade-and-drivers/error-0x80070003-during-process-drivers-for-migration), which shows this same phase/log mechanism on **Windows Server** (a real `Setup phase change: [SetupPhaseInstall] -> [SetupPhaseError]` line), confirming it isn't a Windows-11/client-only behavior.
+
 
 ## Supported inputs at a glance
 
@@ -153,6 +180,10 @@ A PR with a validated client sample/fixture is very welcome.
   false-positive (not observed in practice).
 - Not validated against Windows 11/client in-place upgrades. See
   [Scope](#scope-windows-server-only-so-far) above.
+- The IPU phase checklist only distinguishes **Downlevel** from **Post-reboot**; it
+  can't reliably split Safe OS from First boot from Second boot/OOBE from the two log
+  sources this tool parses. See
+  [Phase checklist: how it's derived](#phase-checklist-how-its-derived) above.
 
 ## Contributing
 

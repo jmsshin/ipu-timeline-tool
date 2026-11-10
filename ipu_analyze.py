@@ -1038,7 +1038,10 @@ def render_attempt_detail(am, idx, total):
     else:
         plateau = ''
     parts.append(A + hdr + '<h2>Progress vs time</h2>' +
-                 svg_progress(am['progress'], astart, aend, am['stall']) + plateau + _time_budget(am) + Z)
+                 svg_progress(am['progress'], astart, aend, am['stall']) + plateau + _time_budget(am) +
+                 '<p class="note">This % is scoped to this capture and only reaches 100% at the end of the '
+                 'post-reboot work, not when the whole upgrade is done. See the IPU phase checklist above for '
+                 'a more reliable view of where this run actually is.</p>' + Z)
     # phases
     if am['phase_rows']:
         items = [(r['phase'].replace('SetupPhase', ''), r['dur'], fmt_dur(r['dur'])) for r in am['phase_rows']]
@@ -1206,6 +1209,29 @@ def render_html(model):
       </div>
       <div class="verdict">{m['verdict']}</div>
     </div>''')
+
+    # IPU PHASE CHECKLIST: where this run actually is, as an alternative to a raw %
+    # (right after the hero, ahead of recommendations, since it's the orientation
+    # the rest of the report builds on)
+    pcl = m.get('phase_checklist') or []
+    if pcl:
+        status_icon = {'done': '&#9989;', 'current': '&#128312;', 'stalled': '&#9888;&#65039;',
+                       'failed': '&#10060;', 'not_reached': '&#11036;', 'triggered': '&#9888;&#65039;'}
+        status_label = {'done': 'DONE', 'current': 'IN PROGRESS', 'stalled': 'STUCK HERE',
+                         'failed': 'FAILED HERE', 'not_reached': 'NOT REACHED', 'triggered': 'TRIGGERED'}
+        rows_html = ''.join(
+            f'<li class="phaserow phase-{r["status"]}"><span class="pico">{status_icon.get(r["status"], "")}</span>'
+            f'<span class="pstatus">{status_label.get(r["status"], "")}</span> <b>{r["label"]}</b>'
+            f'<div class="small muted">{esc(r["sub"])}</div>'
+            f'<div class="small" style="margin-top:4px">{r["detail"]}</div></li>'
+            for r in pcl)
+        refs = ''.join(f'<li><a href="{url}">{esc(title)}</a></li>' for title, url in PHASE_DOC_REFS)
+        parts.append('<div class="card"><h2>IPU phase checklist</h2><ul class="phaselist">' + rows_html + '</ul>'
+                     '<p class="note">A raw progress % is scoped to whatever capture this tool is reading, and '
+                     'Microsoft documents it as only reaching 100% at the end of the post-reboot work, not when '
+                     'the whole upgrade is actually done. Treat phase completion above as the primary '
+                     '"where are we" signal, and the % charts below as supporting detail within a phase.</p>'
+                     '<p class="note">Phase reference:</p><ul class="reclist small">' + refs + '</ul></div>')
 
     # RECOMMENDED NEXT STEPS (prominent, right after hero)
     recs = m.get('recommendations') or []
@@ -1431,6 +1457,19 @@ h2{font-size:15px;margin:0 0 12px;color:#cdd7ea}
 .recs{border-color:#2f57b8;background:linear-gradient(135deg,#141d33,#131a2b)}
 .reclist{margin:6px 0 0;padding-left:20px}
 .reclist li{margin:9px 0;color:#dfe7f5;font-size:13px}
+.phaselist{list-style:none;margin:6px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.phaserow{border-radius:8px;padding:10px 14px;border:1px solid #263149;background:#0e1626}
+.phaserow .pico{margin-right:6px}
+.phaserow .pstatus{font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--mut);margin-right:6px}
+.phase-done{border-color:var(--acc2)}
+.phase-done .pstatus{color:var(--acc2)}
+.phase-current{border-color:var(--acc)}
+.phase-current .pstatus{color:var(--acc)}
+.phase-stalled,.phase-triggered{border-color:var(--warn)}
+.phase-stalled .pstatus,.phase-triggered .pstatus{color:var(--warn)}
+.phase-failed{border-color:var(--bad)}
+.phase-failed .pstatus{color:var(--bad)}
+.phase-not_reached{opacity:.55}
 .pr{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:10px;margin-right:8px;vertical-align:middle}
 .pr.p1{background:#3a1620;color:#ff8a97;border:1px solid #ff5c6c}
 .pr.p2{background:#2a2410;color:#ffcf7a;border:1px solid #f5a623}
@@ -1598,6 +1637,97 @@ def parse_online_phase(found):
     meaningful = bool(a['phase_rows']) or a['max_pct'] > 0
     return dict(meaningful=meaningful, booted=booted, model=a)
 
+# --------------------------------------------------------------------------
+# macro IPU phase checklist
+# --------------------------------------------------------------------------
+# A raw progress % is a poor "where are we" indicator on its own: it is scoped to
+# whichever log this tool happens to be reading, and Microsoft's own docs note the
+# in-box upgrade UI's percentage only reaches 100% at the END of the post-reboot
+# work, not when the whole upgrade is actually done. So alongside the % curve, build
+# a small checklist of the real macro phases Windows Setup goes through, and show
+# which already finished, which this run is currently in (or stuck/failed in), and
+# which haven't been reached yet. References for the phase model used below:
+PHASE_DOC_REFS = [
+    ('Windows 10 upgrade issues troubleshooting (names the phases: Downlevel, Safe OS, First boot, Second boot/OOBE, Uninstall)',
+     'https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/windows-10-upgrade-issues-troubleshooting'),
+    ('Windows 10 upgrade error codes (the numbered SP_EXECUTION_* phase enum behind "extend codes")',
+     'https://learn.microsoft.com/en-us/troubleshoot/windows-client/deployment/windows-10-upgrade-error-codes'),
+    ('Windows Server KB confirming the same phase/log mechanism on Server ("Setup phase change: [SetupPhaseInstall] -> [SetupPhaseError]")',
+     'https://learn.microsoft.com/en-us/troubleshoot/windows-server/setup-upgrade-and-drivers/error-0x80070003-during-process-drivers-for-migration'),
+]
+
+def build_phase_checklist(primary, final_code, online):
+    """Return an ordered list of macro-phase rows (Downlevel, post-reboot, and an
+    optional rollback row), each with a status of done / current / stalled / failed /
+    not_reached. This tool only ever sees two log sources (the pre-reboot downlevel
+    capture and, if present, the post-reboot online capture), so it cannot reliably
+    split Safe OS from First boot from Second boot/OOBE on its own; those finer
+    sub-phases are documented in PHASE_DOC_REFS for readers who want the full model."""
+    rows = []
+    hang = primary.get('hang')
+    stall = primary.get('stall')
+    booted = bool(online and online.get('booted'))
+
+    # Downlevel: runs in the OLD os (file copy, compat checks, offline apply of the
+    # new OS image onto disk). Covers SP_EXECUTION_DOWNLEVEL and SP_EXECUTION_SAFE_OS.
+    if booted:
+        status = 'done'
+        detail = f'Completed; this run progressed past the first reboot (reached {primary["max_pct"]}% here).'
+    elif final_code:
+        status = 'failed'
+        detail = f'Failed here with <b>{esc(final_code)}</b> {esc(code_note(final_code))}.'
+    elif hang:
+        status = 'stalled'
+        detail = f'Hung here: no log activity for <b>{fmt_dur(hang["secs"])}</b> starting {hang["start"]:%H:%M:%S}.'
+    elif stall and stall[1] > 1800:
+        status = 'stalled'
+        detail = f'Progress stalled at <b>{stall[0]}%</b> for <b>{fmt_dur(stall[1])}</b>.'
+    else:
+        status = 'current'
+        detail = 'Still the most recent activity in this capture; no stall, hang, or failure detected yet.'
+    rows.append(dict(key='downlevel', label='Downlevel',
+                      sub='Old OS: file copy, compatibility checks, offline apply of the new OS image',
+                      status=status, detail=detail))
+
+    # Post-reboot: runs in the NEW os. Covers SP_EXECUTION_FIRST_BOOT + OOBE_BOOT.
+    if online is None:
+        rows.append(dict(key='postreboot', label='Post-reboot (First boot &rarr; Second boot/OOBE)',
+                          sub='New OS: driver install, first boot, OOBE',
+                          status='not_reached',
+                          detail='Not observed in this capture (no post-reboot setupact.log found).'))
+    elif online.get('meaningful') and not booted:
+        rows.append(dict(key='postreboot', label='Post-reboot (First boot &rarr; Second boot/OOBE)',
+                          sub='New OS: driver install, first boot, OOBE',
+                          status='not_reached',
+                          detail='The new OS image was staged during the offline apply, but this run never rebooted into it.'))
+    else:
+        oa = online['model']
+        if oa.get('hang'):
+            status = 'stalled'
+            detail = f'Hung after reboot: no log activity for <b>{fmt_dur(oa["hang"]["secs"])}</b>.'
+        elif oa.get('stall') and oa['stall'][1] > 1800:
+            status = 'stalled'
+            detail = f'Stalled post-reboot at <b>{oa["stall"][0]}%</b> for <b>{fmt_dur(oa["stall"][1])}</b>.'
+        elif final_code:
+            status = 'failed'
+            detail = f'Failed post-reboot with <b>{esc(final_code)}</b> {esc(code_note(final_code))}.'
+        else:
+            status = 'done'
+            detail = f'Reached {oa["max_pct"]}% post-reboot with no stall or hang detected.'
+        rows.append(dict(key='postreboot', label='Post-reboot (First boot &rarr; Second boot/OOBE)',
+                          sub='New OS: driver install, first boot, OOBE', status=status, detail=detail))
+
+    # Rollback/uninstall: Windows Setup automatically reverts to the previous OS when
+    # an attempt does not finish successfully, so only show this row when a failure or
+    # a cancellation was actually detected (never on a bare hang with no result yet).
+    if final_code or primary.get('cancel_ts'):
+        rows.append(dict(key='rollback', label='Rollback / Uninstall',
+                          sub='Automatic revert to the previous OS after an unsuccessful attempt',
+                          status='triggered',
+                          detail='Windows Setup reverts to the previous OS when an attempt does not finish successfully.'))
+    return rows
+
+
 def _no_ipu_model(found, label, is_local=False):
     """Build an explanatory model when a SetupReport has no in-place upgrade run."""
     probes = []
@@ -1681,6 +1811,7 @@ def analyze_report(found, label, attempt_sel=None, show_all=False, want_miglog=F
     recs = build_recommendations(primary, err, corr, corr_assess, diag, scan, incomplete)
     verdict = build_verdict(primary, err, corr, diag, stale_code, scan, incomplete)
     online = parse_online_phase(found)
+    phase_checklist = build_phase_checklist(primary, final_code, online)
     miglog = None
     if want_miglog and found.get('miglog'):
         print(f'    [*] parsing MigLog.xml ({os.path.getsize(found["miglog"])//(1024*1024)} MB)...')
@@ -1690,7 +1821,7 @@ def analyze_report(found, label, attempt_sel=None, show_all=False, want_miglog=F
                 incomplete=incomplete, scan=scan,
                 setupdiag=diag, corruption=corr, corr_assess=corr_assess,
                 recommendations=recs, verdict=verdict, report_date=report_date(label),
-                online=online, miglog=miglog)
+                online=online, phase_checklist=phase_checklist, miglog=miglog)
 
 def _print_summary(model):
     if model.get('no_ipu'):
@@ -1704,6 +1835,11 @@ def _print_summary(model):
     attempts = model['attempts']; sel = model['sel_indices']; primary = attempts[sel[0]]
     err = model['err']; corr = model['corruption']
     print(f"\n=== {model['source_label']} ({len(attempts)} attempt(s), detailing #{sel[0]+1}) ===")
+    for r in model.get('phase_checklist', []):
+        tag = {'done': 'DONE', 'current': 'IN PROGRESS', 'stalled': 'STUCK', 'failed': 'FAILED',
+               'not_reached': 'not reached', 'triggered': 'triggered'}.get(r['status'], r['status'])
+        lbl = r['label'].replace('&rarr;', '->')
+        print(f"   phase  : {lbl:<38} [{tag}]")
     for i, a in enumerate(attempts):
         mark = '*' if i in sel else ' '
         top = sorted(a['mig_folder'].items(), key=lambda x:-x[1])[:1]
@@ -1791,6 +1927,7 @@ def analyze(inp, out_html, out_json=None, attempt_sel=None, show_all=False, want
             jm = [dict(label=m['source_label'], date=str(m['report_date']), final=m.get('final_code'),
                        incomplete=m.get('incomplete'), hard_blocks=(m.get('scan') or {}).get('hard_blocks'),
                        gather_fail=(m.get('err') or {}).get('gather_fail'), corr=m.get('corruption'),
+                       phases=m.get('phase_checklist', []),
                        recs=[r['text'] for r in m.get('recommendations', [])]) for m in models]
             with open(out_json, 'w', encoding='utf-8') as f:
                 json.dump(jm, f, indent=2, default=str)
