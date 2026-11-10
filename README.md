@@ -1,40 +1,40 @@
 # ipu-timeline
 
-**Find out why a Windows Server in-place upgrade (IPU) is stuck, slow, or failed — in
-seconds, not hours of scrolling through `setupact.log`.**
+**Find out why a Windows Server in-place upgrade (IPU) is stuck, slow, or failed.**
+Get the answer in seconds, not hours of scrolling through `setupact.log`.
 
 `ipu_analyze.py` is a single, dependency-free Python script that reads Windows Setup's
 own logs and renders a self-contained HTML report whose whole point is to answer one
 question: **what is actually blocking this upgrade, and what should you try next?**
 
-Built and validated against **Windows Server** in-place upgrades — 2012 R2/2016/2019 →
-2016/2019/2022/2025, on-prem or on an [Azure VM](https://learn.microsoft.com/en-us/azure/virtual-machines/windows-in-place-upgrade).
+Built and validated against **Windows Server** in-place upgrades (2012 R2/2016/2019 →
+2016/2019/2022/2025), on-prem or on an [Azure VM](https://learn.microsoft.com/en-us/azure/virtual-machines/windows-in-place-upgrade).
 See [Scope: Windows Server only (so far)](#scope-windows-server-only-so-far) below
 before pointing this at a Windows 11/client upgrade.
 
-![Report example — recommended next steps](docs/sample-recommendations.png)
+![Report example: recommended next steps](docs/sample-recommendations.png)
 
 ## Two ways to run it
 
 You don't need to collect logs first if you're already on the affected machine.
 
-**1. Run it directly on the server having the problem — no log collection needed:**
+**1. Run it directly on the server having the problem. No log collection needed:**
 
 ```powershell
 python ipu_analyze.py --local -o report.html
 ```
 
 This reads straight from the well-known Windows Setup log locations
-(`$WINDOWS.~BT\Sources\Panther`, `C:\Windows\Panther`, `C:\Windows\Logs\CBS`, etc.) —
-no TSS, no log-gathering tool, no zip file. Run it as soon as possible after a
+(`$WINDOWS.~BT\Sources\Panther`, `C:\Windows\Panther`, `C:\Windows\Logs\CBS`, etc.).
+No TSS, no log-gathering tool, no zip file. Run it as soon as possible after a
 stuck/failed attempt: Windows deletes these logs automatically roughly 10 days after
 the upgrade finishes or rolls back (sooner if someone runs Disk Cleanup's "Previous
 Windows installation(s)"). You may need an elevated/Administrator prompt to read some
 of them.
 
-**2. Point it at logs you already collected** — from a TSS export, a tool like
-[Microsoft's `TSS`](https://aka.ms/getTSS), a copied `Setup_Report` folder, or just a
-`setupact.log` someone emailed you:
+**2. Point it at logs you already collected.** This works from a TSS export, a tool
+like [Microsoft's `TSS`](https://aka.ms/getTSS), a copied `Setup_Report` folder, or
+just a `setupact.log` someone emailed you:
 
 ```powershell
 python ipu_analyze.py path\to\TSS_Export.zip -o report.html
@@ -55,42 +55,42 @@ python samples\make_sample.py
 python ipu_analyze.py samples\Setup_Report_sample -o samples\sample_report.html
 ```
 
-(A ready-made copy is already committed at `samples/sample_report.html` — open it in a
+(A ready-made copy is already committed at `samples/sample_report.html`. Open it in a
 browser to see what a report looks like.)
 
 ## What the report tells you
 
-1. **Recommended next steps** — prioritized DO FIRST / NEXT / HYGIENE actions derived
+1. **Recommended next steps**: prioritized DO FIRST / NEXT / HYGIENE actions derived
    from the findings, not a generic checklist.
-2. **Attempts overview** — one row per attempt (window, duration, max %, longest
+2. **Attempts overview**: one row per attempt (window, duration, max %, longest
    stall, top migrated folder). Attempts are split on `SetupHost Logging Begin`.
-3. **Progress vs. time** — the global-progress % curve, extended flat through a stall
+3. **Progress vs. time**: the global-progress % curve, extended flat through a stall
    so "stuck at NN%" reads as one continuous line instead of blank space.
-4. **Hang vs. busy plateau** — a flat % is only called a **hang** when the log itself
+4. **Hang vs. busy plateau**: a flat % is only called a **hang** when the log itself
    goes silent for 30+ minutes through it. Otherwise it's reported as *busy* (e.g.
    USMT still migrating files) with the longest-running operation called out.
-5. **Phase durations & longest operations** — from `Setup phase change:` markers and
-   the SP operation table, including a synthetic bar for an offline-apply/migration
+5. **Phase durations & longest operations**: from `Setup phase change:` markers and
+   the SP operation table. Includes a synthetic bar for an offline-apply/migration
    op that never completes when the run is cancelled mid-way.
-6. **Finalize timing telemetry** — `CSetupDiagnostics … [*Time]=[0x..]` values (e.g.
+6. **Finalize timing telemetry**: `CSetupDiagnostics … [*Time]=[0x..]` values (e.g.
    `DriverMigrationTime` dominating = USMT file migration is the bottleneck).
-7. **Migrated-file hotspots** — `MIG … Processing File:` lines bucketed by folder.
+7. **Migrated-file hotspots**: `MIG … Processing File:` lines bucketed by folder.
    `C:\Windows\SystemTemp` dominating is the classic multi-hour cause: USMT looping
    millions of tiny temp files one at a time.
-8. **USMT migration breakdown** (`--miglog`, opt-in — `MigLog.xml` can be 300 MB+) —
+8. **USMT migration breakdown** (`--miglog`, opt-in; `MigLog.xml` can be 300 MB+):
    migrated units by group/role/agent and migration-plugin action counts.
-9. **Online/new-OS phase** — distinguishes an offline-applied specialize phase
+9. **Online/new-OS phase**: distinguishes an offline-applied specialize phase
    (labeled explicitly as *not* a real reboot) from a true post-reboot first boot.
-10. **Outcome** — the final result code with a plain-English explanation, SetupDiag's
-    failing operation, a **compatibility hard-block panel** (parsed from
-    `ScanResult.xml` — e.g. a domain controller missing `ADPREP /DOMAINPREP`, with
-    targeted remediation), a **migration-plugin Gather-failure callout** (the real
-    blocker when a USMT plugin fails, instead of the generic wrapper error code that
-    follows it), and an intentionally honest **CBS corruption assessment** (NOISE /
-    RELEVANT / BLOCKER — it will not overstate corruption as *the* cause from logs
-    alone).
-11. **Which logs to check** — a short IPU log cheat-sheet.
-12. **No-IPU / incomplete-capture detection** — if the logs show no in-place upgrade
+10. **Outcome**: the final result code with a plain-English explanation, plus
+    SetupDiag's failing operation. It also includes a **compatibility hard-block
+    panel** (parsed from `ScanResult.xml`; e.g. a domain controller missing
+    `ADPREP /DOMAINPREP`, with targeted remediation), a **migration-plugin
+    Gather-failure callout** (the real blocker when a USMT plugin fails, instead of
+    the generic wrapper error code that follows it), and an intentionally honest
+    **CBS corruption assessment** (NOISE / RELEVANT / BLOCKER). It will not
+    overstate corruption as *the* cause from logs alone.
+11. **Which logs to check**: a short IPU log cheat-sheet.
+12. **No-IPU / incomplete-capture detection**: if the logs show no in-place upgrade
     ever ran, or the capture was cut off mid-write (a long run of NUL padding at EOF),
     the report says so plainly instead of guessing or fabricating a final result.
 
@@ -101,7 +101,7 @@ browser to see what a report looks like.)
 | `--local` | Reads the live machine's own Panther/CBS/BlueBox logs directly. |
 | `some.zip` | A TSS export or any zip containing a `Setup_Report`-style layout; only the needed files are extracted to a temp dir and cleaned up afterward. |
 | `Setup_Report_*\` folder | Analyzed directly. |
-| folder with several `Setup_Report*` subfolders | Multi-capture comparison page + one detail page per capture, oldest → newest — useful for seeing whether a fix actually moved the needle across retries. |
+| folder with several `Setup_Report*` subfolders | Multi-capture comparison page plus one detail page per capture, oldest to newest. Useful for seeing whether a fix actually moved the needle across retries. |
 | a bare `setupact.log` | Analyzed on its own (looks for a sibling `setuperr.log` too). |
 
 ## CLI reference
@@ -119,9 +119,9 @@ python ipu_analyze.py --local [-o <OUT.html>] [--json <MODEL.json>] [--miglog]
 | `--json` | Also write the parsed model as JSON. |
 | `--attempt N` | Detail this attempt (1-based); default is the last attempt. |
 | `--all` | Render detail for every attempt instead of just one. |
-| `--miglog` | Also parse `MigLog.xml` for a USMT migration breakdown (off by default — can be 300 MB+). |
+| `--miglog` | Also parse `MigLog.xml` for a USMT migration breakdown (off by default; can be 300 MB+). |
 
-Requires **Python 3.7+**, standard library only — nothing to `pip install`. Streams
+Requires **Python 3.7+**, standard library only. Nothing to `pip install`. Streams
 very large logs (150 MB+ `setupact.log`) in a single pass.
 
 ## Scope: Windows Server only (so far)
@@ -136,12 +136,12 @@ This tool was built and tested entirely against **Windows Server** in-place upgr
 uses the same underlying Setup/Panther logging family, so some of this *may* carry
 over, but the phase names, folder layout, and result/extend codes have not been
 verified against real client-upgrade logs, and this repo has no client sample data. If
-you try it against a Windows 11 feature-update capture, treat the output with caution
-— and a PR with a validated client sample/fixture is very welcome.
+you try it against a Windows 11 feature-update capture, treat the output with caution.
+A PR with a validated client sample/fixture is very welcome.
 
 ## Known limitations
 
-- `--local` only finds anything while the upgrade's working folders still exist —
+- `--local` only finds anything while the upgrade's working folders still exist.
   Windows removes `$WINDOWS.~BT` automatically (roughly 10 days after the upgrade
   finishes/rolls back, sooner via Disk Cleanup), so run it promptly after a
   stuck/failed attempt, or fall back to a saved TSS export.
@@ -151,12 +151,12 @@ you try it against a Windows 11 feature-update capture, treat the output with ca
 - Truncated-capture detection is a NUL-byte-tail heuristic; a log that happens to end
   exactly on a sector boundary with legitimate trailing NULs could in theory
   false-positive (not observed in practice).
-- Not validated against Windows 11/client in-place upgrades — see
+- Not validated against Windows 11/client in-place upgrades. See
   [Scope](#scope-windows-server-only-so-far) above.
 
 ## Contributing
 
-Issues and PRs welcome — especially new result-code meanings (`CODE_MEANINGS`), new
+Issues and PRs welcome, especially new result-code meanings (`CODE_MEANINGS`), new
 migrated-path buckets (`classify_path`), or new `ScanResult.xml` hard-block plugin
 guidance (`SCAN_BLOCK_GUIDANCE`) in `ipu_analyze.py`.
 
