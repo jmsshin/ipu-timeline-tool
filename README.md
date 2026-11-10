@@ -7,8 +7,10 @@ seconds, not hours of scrolling through `setupact.log`.**
 own logs and renders a self-contained HTML report whose whole point is to answer one
 question: **what is actually blocking this upgrade, and what should you try next?**
 
-Works for Server (and desktop) in-place upgrades — 2016 → 2019/2022/2025, or any
-Windows-to-Windows IPU that shares the same Panther/CBS/USMT logging.
+Built and validated against **Windows Server** in-place upgrades — 2012 R2/2016/2019 →
+2016/2019/2022/2025, on-prem or on an [Azure VM](https://learn.microsoft.com/en-us/azure/virtual-machines/windows-in-place-upgrade).
+See [Scope: Windows Server only (so far)](#scope-windows-server-only-so-far) below
+before pointing this at a Windows 11/client upgrade.
 
 ![Report example — recommended next steps](docs/sample-recommendations.png)
 
@@ -122,6 +124,21 @@ python ipu_analyze.py --local [-o <OUT.html>] [--json <MODEL.json>] [--miglog]
 Requires **Python 3.7+**, standard library only — nothing to `pip install`. Streams
 very large logs (150 MB+ `setupact.log`) in a single pass.
 
+## Scope: Windows Server only (so far)
+
+This tool was built and tested entirely against **Windows Server** in-place upgrades
+(2012 R2/2016/2019 → 2016/2019/2022/2025), following the official process described in:
+
+- [Upgrade Windows Server in place](https://learn.microsoft.com/en-us/windows-server/get-started/upgrade-in-place?tabs=media) (installation media or Windows Update)
+- [Windows in-place upgrade - Azure Virtual Machines](https://learn.microsoft.com/en-us/azure/virtual-machines/windows-in-place-upgrade) (Azure VM-specific guidance; also notes the caveats around Azure guest-patching/image features after an in-place upgrade)
+
+**Windows 11/client in-place upgrades (feature updates) are untested.** Client Windows
+uses the same underlying Setup/Panther logging family, so some of this *may* carry
+over, but the phase names, folder layout, and result/extend codes have not been
+verified against real client-upgrade logs, and this repo has no client sample data. If
+you try it against a Windows 11 feature-update capture, treat the output with caution
+— and a PR with a validated client sample/fixture is very welcome.
+
 ## Known limitations
 
 - `--local` only finds anything while the upgrade's working folders still exist —
@@ -134,6 +151,8 @@ very large logs (150 MB+ `setupact.log`) in a single pass.
 - Truncated-capture detection is a NUL-byte-tail heuristic; a log that happens to end
   exactly on a sector boundary with legitimate trailing NULs could in theory
   false-positive (not observed in practice).
+- Not validated against Windows 11/client in-place upgrades — see
+  [Scope](#scope-windows-server-only-so-far) above.
 
 ## Contributing
 
