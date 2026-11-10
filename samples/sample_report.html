@@ -1,0 +1,78 @@
+<!doctype html><html><head><meta charset="utf-8">
+<title>IPU Timeline Analysis</title>
+<style>
+:root{--bg:#0f1420;--card:#171e2e;--ink:#e7ecf5;--mut:#8a97ad;--acc:#4f7cff;--acc2:#28c2a0;--acc3:#f5a623;--bad:#ff5c6c;--warn:#f5a623;--grid:#273349}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 'Segoe UI',system-ui,sans-serif;padding:24px}
+.hero{background:linear-gradient(135deg,#1b2740,#141b2b);border:1px solid #26314a;border-radius:14px;padding:22px 24px;margin-bottom:18px}
+h1{margin:0 0 2px;font-size:22px}
+h2{font-size:15px;margin:0 0 12px;color:#cdd7ea}
+.sub{color:var(--mut);font-size:13px;margin-bottom:14px}
+.kpis{display:flex;gap:26px;flex-wrap:wrap;margin:8px 0 12px}
+.kpi .n{font-size:24px;font-weight:700;color:#fff}
+.kpi .l{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.verdict{background:#0e1626;border-left:3px solid var(--acc);padding:10px 14px;border-radius:6px;color:#dfe7f5}
+.card{background:var(--card);border:1px solid #232d44;border-radius:12px;padding:18px 20px;margin-bottom:16px}
+.chart{width:100%;height:auto;display:block;margin:4px 0}
+.grid{stroke:var(--grid);stroke-width:1}
+.axl,.axl2{fill:var(--mut);font-size:11px}
+.axl2{font-size:12px}
+.cap{fill:var(--mut);font-size:11px}
+.progline{fill:none;stroke:var(--acc);stroke-width:2.2}
+.stall{fill:rgba(255,92,108,.12)}
+.stalllbl{fill:var(--bad);font-size:11px;font-weight:600}
+.bar{fill:var(--acc)} .bar2{fill:var(--acc2)} .bar3{fill:var(--acc3)} .badbar{fill:var(--bad)}
+.note{color:var(--mut);font-size:12.5px;margin:10px 0 0}
+.small{font-size:12px}.muted{color:var(--mut)}
+.mono{font-family:Consolas,monospace}
+.panel{background:#0e1626;border:1px solid #263149;border-radius:8px;padding:10px 14px;margin:8px 0}
+.panel.bad{border-color:var(--bad);background:#26141a}
+.panel.warn{border-color:var(--warn);background:#241f12}
+.panel.ok{border-color:var(--acc2);background:#122420}
+.recs{border-color:#2f57b8;background:linear-gradient(135deg,#141d33,#131a2b)}
+.reclist{margin:6px 0 0;padding-left:20px}
+.reclist li{margin:9px 0;color:#dfe7f5;font-size:13px}
+.pr{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:10px;margin-right:8px;vertical-align:middle}
+.pr.p1{background:#3a1620;color:#ff8a97;border:1px solid #ff5c6c}
+.pr.p2{background:#2a2410;color:#ffcf7a;border:1px solid #f5a623}
+.pr.p3{background:#16233a;color:#9db4e6;border:1px solid #3a5488}
+.atag{display:inline-block;background:#0e1626;border:1px solid #2b3a58;color:#9fb2d6;font-size:12px;padding:3px 10px;border-radius:20px;margin-bottom:10px}
+pre.log{background:#0b101b;border:1px solid #222c42;border-radius:8px;padding:12px;overflow:auto;font:12px/1.45 Consolas,monospace;color:#c7d2e6}
+details summary{cursor:pointer;color:var(--acc);margin-top:8px}
+table.ref{width:100%;border-collapse:collapse;font-size:12.5px}
+table.ref th,table.ref td{border:1px solid #263149;padding:6px 9px;text-align:left;vertical-align:top}
+table.ref th{background:#0e1626;color:#cdd7ea}
+code{background:#0b101b;padding:1px 5px;border-radius:4px;font-family:Consolas,monospace;color:#a9c1ff}
+</style></head><body><div class="hero">
+      <h1>IPU Timeline Analysis</h1>
+      <div class="sub">Setup_Report_sample &mdash; 1 attempt(s) detected</div>
+      <div class="kpis">
+        <div class="kpi"><div class="n">1h48m</div><div class="l">attempt duration</div></div>
+        <div class="kpi"><div class="n">1</div><div class="l">phases</div></div>
+        <div class="kpi"><div class="n">500</div><div class="l">files migrated (MIG)</div></div>
+        <div class="kpi"><div class="n">0x80070070</div><div class="l">final result</div></div>
+      </div>
+      <div class="verdict">This IPU was <b>not hung</b> - it was migration was looping <b>500</b> files (100%) under <b>C:\Windows\SystemTemp</b>; failed with <b>0x80070070</b> ERROR_DISK_FULL (not enough disk space).</div>
+    </div>
+<div class="card recs"><h2>Recommended next steps</h2><ol class="reclist"><li><span class="pr p1">DO FIRST</span> <b>Empty <code>C:\Windows\SystemTemp</code> before the next attempt</b> (keep the folder, delete its contents). USMT migrated <b>500</b> files (100%) from there one-by-one. Then identify the process/app generating those files so the bloat does not return: check the file owner/ACL on a few of them, and/or run Process Monitor filtered to <code>Path contains C:\Windows\SystemTemp</code> on the live VM.</li><li><span class="pr p1">DO FIRST</span> <b>Free up disk space (0x80070070 = disk full)</b> and retry; IPU needs substantial free space on C:.</li><li><span class="pr p3">HYGIENE</span> <b>Before the next attempt:</b> take a VM snapshot/restore point, make sure the OS has the latest SSU+LCU, delete stale <code>C:\$WINDOWS.~BT</code> / <code>C:\$Windows.~WS</code>, and collect a fresh TSS SetupReport so this tool can confirm the blocker moved.</li></ol></div>
+<div class="card"><h2>Progress vs time</h2><svg viewBox="0 0 900 260" class="chart">
+      <rect x="751.2" y="16" width="132.8" height="210" class="stall"/><text x="817.6" y="30" class="stalllbl" text-anchor="middle">stuck at 91% for 17m08s</text><line x1="46" y1="226.0" x2="884" y2="226.0" class="grid"/><text x="40" y="229.0" class="axl" text-anchor="end">0%</text><line x1="46" y1="173.5" x2="884" y2="173.5" class="grid"/><text x="40" y="176.5" class="axl" text-anchor="end">25%</text><line x1="46" y1="121.0" x2="884" y2="121.0" class="grid"/><text x="40" y="124.0" class="axl" text-anchor="end">50%</text><line x1="46" y1="68.5" x2="884" y2="68.5" class="grid"/><text x="40" y="71.5" class="axl" text-anchor="end">75%</text><line x1="46" y1="16.0" x2="884" y2="16.0" class="grid"/><text x="40" y="19.0" class="axl" text-anchor="end">100%</text><line x1="46.0" y1="16" x2="46.0" y2="226" class="grid"/><text x="46.0" y="242" class="axl" text-anchor="middle">0h</text><line x1="511.0" y1="16" x2="511.0" y2="226" class="grid"/><text x="511.0" y="242" class="axl" text-anchor="middle">1h</text>
+      <polyline points="46.0,226.0 100.2,211.3 154.5,196.6 208.7,181.9 263.0,167.2 317.2,152.5 371.5,137.8 425.7,123.1 480.0,108.4 534.2,93.7 588.5,79.0 642.7,64.3 697.0,49.6 751.2,34.9 884.0,34.9" class="progline"/>
+      <text x="46" y="12" class="cap">Global progress % vs time</text>
+    </svg><p class="note">Longest plateau: <b>91%</b> held for <b>17m08s</b> starting 2026-01-15 03:31:00 UTC. Log activity continued through it, so setup was actively working, not hung.</p></div>
+<div class="card"><h2>Phase durations</h2><svg viewBox="0 0 900 36" class="chart"><text x="0" y="21" class="axl2">Finalize</text><rect x="260" y="10" width="520.0" height="16" class="bar"/><text x="786.0" y="22" class="axl2">17m08s</text></svg><p class="note">Phases from <code>Setup phase change: [x] -&gt; [y]</code> (downlevel portion; a cancelled IPU never reaches SafeOS/FirstBoot).</p></div>
+<div class="card"><h2>Migrated-file hotspots (MIG "Processing File")</h2><svg viewBox="0 0 900 36" class="chart"><text x="0" y="21" class="axl2">C:\Windows\SystemTemp</text><rect x="260" y="10" width="520.0" height="16" class="bar3"/><text x="786.0" y="22" class="axl2">500 (100%)</text></svg><p class="note">Total processed = <b>500</b>. A single folder dominating (often <code>C:\Windows\SystemTemp</code>) means USMT is looping millions of tiny files. Clearing that folder before the retry is the fix. If it refills, a live process is generating them (check file owner/ACL or run ProcMon on the folder).</p></div>
+<div class="card"><h2>Outcome</h2><div class="panel">Final result: <b>0x80070070</b> ERROR_DISK_FULL (not enough disk space)</div><details><summary>setuperr.log tail</summary><pre class="log">2026-01-15 03:48:08, Error           SP     Result = 0x80070070</pre></details></div>
+<div class="card"><h2>Which logs to check (IPU cheat-sheet)</h2><table class="ref">
+<tr><th>Log</th><th>Path (under Setup_Report)</th><th>What it tells you</th></tr>
+<tr><td>Downlevel setupact</td><td class="mono">UpgradeSetup\~bt_Panther\setupact.log</td><td>Main timeline: phases, progress %, MIG file migration, finalize telemetry. Biggest/most useful log.</td></tr>
+<tr><td>Downlevel setuperr</td><td class="mono">UpgradeSetup\~bt_Panther\setuperr.log</td><td>Error chain + final result code (0x800704C7 cancel, 0x8007007f plugin, etc.).</td></tr>
+<tr><td>Online setupact</td><td class="mono">UpgradeSetup\win_Panther\NewOs\Panther\setupact.log</td><td>First/second-boot (online) phase - only present if the IPU rebooted into the new OS.</td></tr>
+<tr><td>SetupDiag</td><td class="mono">logs\SetupDiag\setupdiagresults.xml</td><td>Microsoft's own verdict: failure profile, error + extended code, failing operation.</td></tr>
+<tr><td>BlueBox</td><td class="mono">logs\MoSetup\BlueBox.log</td><td>MoSetup host result + cleanup; terminal wWinMain error code.</td></tr>
+<tr><td>CBS</td><td class="mono">logs\CBS\CBS.log</td><td>Component-store corruption (CSI Payload Corrupt, Total Detected/Repaired, 0x800f0906).</td></tr>
+<tr><td>MigLog</td><td class="mono">UpgradeSetup\~bt_Panther\MigLog.xml</td><td>Full USMT migration inventory (large) - what got gathered/applied.</td></tr>
+<tr><td>ScanResult</td><td class="mono">UpgradeSetup\~bt_Panther\ScanResult.xml</td><td>Pre-flight compat scan verdict per hardware/plugin/program (BlockingType=Hard/None + Message) - e.g. a domain controller missing ADPREP /DOMAINPREP.</td></tr>
+</table>
+<p class="note"><b>Reading the phases:</b> Downlevel (running OS) &rarr; SafeOS/WinPE (offline apply) &rarr; FirstBoot &rarr; SecondBoot &rarr; OOBE. Progress 0-~90% is downlevel+offline apply; a stall at ~88-90% is almost always the offline apply / USMT migration.</p></div>
+<div class="card"><h2>Sources parsed</h2><div class="small">downlevel_act: <span class="mono small">samples\Setup_Report_sample\~bt_Panther\setupact.log</span><br>downlevel_err: <span class="mono small">samples\Setup_Report_sample\~bt_Panther\setuperr.log</span></div><div class="small muted" style="margin-top:8px">Generated 2026-11-10 15:47 local by ipu_analyze.py. Times shown are raw log timestamps (Azure IPU logs are UTC).</div></div></body></html>

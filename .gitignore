@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# scratch output from manual runs (the committed samples/ files are intentional)
+/ipu_report.html
+/report.html
+*.ipu_tmp/
+
+.DS_Store
+Thumbs.db
