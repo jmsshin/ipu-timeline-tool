@@ -136,13 +136,19 @@ def detect_truncation(path, min_null_run=4096):
         return dict(null_bytes=null_bytes, size=size, last_nonzero_offset=last_nonzero)
     except Exception:
         return None
-
 # --------------------------------------------------------------------------
 # log discovery
 # --------------------------------------------------------------------------
+# '~bt_Panther' is TSS's rename of $WINDOWS.~BT\Sources\Panther. A manual collection
+# (e.g. a PowerShell script run directly on the box, not via TSS) commonly instead
+# names that same folder after its source drive letter, e.g. "C_Panther" /
+# "C_Rollback" - recognize that shape too so hand-collected logs work the same as a
+# TSS export. The single-letter-plus-underscore anchor keeps this from colliding with
+# the unrelated "win_Panther" (post-reboot C:\Windows\Panther) key below.
+DOWNLEVEL_PANTHER = r'(?:~bt_Panther|[\\/][A-Za-z]_Panther)'
 NEEDED = {
-    'downlevel_act':  [r'~bt_Panther[\\/]setupact\.log$'],
-    'downlevel_err':  [r'~bt_Panther[\\/]setuperr\.log$'],
+    'downlevel_act':  [rf'{DOWNLEVEL_PANTHER}[\\/]setupact\.log$'],
+    'downlevel_err':  [rf'{DOWNLEVEL_PANTHER}[\\/]setuperr\.log$'],
     'online_act':     [r'win_Panther[\\/]NewOs[\\/]Panther[\\/]setupact\.log$'],
     'online_err':     [r'win_Panther[\\/]NewOs[\\/]Panther[\\/]setuperr\.log$'],
     'winpanther_act': [r'win_Panther[\\/]setupact\.log$'],
@@ -151,8 +157,8 @@ NEEDED = {
     'setupdiag':      [r'SetupDiag[\\/]setupdiagresults\.xml$'],
     'cbs':            [r'logs[\\/]CBS[\\/]CBS\.log$', r'CBS[\\/]CBS\.log$'],
     'bluebox':        [r'MoSetup[\\/]BlueBox\.log$'],
-    'miglog':         [r'~bt_Panther[\\/]MigLog\.xml$'],
-    'scanresult':     [r'~bt_Panther[\\/]ScanResult\.xml$',
+    'miglog':         [rf'{DOWNLEVEL_PANTHER}[\\/]MigLog\.xml$'],
+    'scanresult':     [rf'{DOWNLEVEL_PANTHER}[\\/]ScanResult\.xml$',
                         r'win_Panther[\\/]NewOs[\\/]Panther[\\/]ScanResult\.xml$'],
 }
 
