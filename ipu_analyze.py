@@ -39,13 +39,36 @@ RESULT_RE = re.compile(r'Result = (0x[0-9A-Fa-f]+)')
 # so it must never be allowed to overwrite the real final_code just because it is the last
 # "Result = 0x..." line physically present in setuperr.log.
 DIAG_ONLY_RESULT_FUNCS = ('ExecuteDiagnosticAnalysis',)
-# A migration plugin's Gather callback failing is reported on two lines:
-#   "Failure while calling IDiscovery->Gather for Plugin={ServerPath="X\Y.dll", ...}. Error: 0x..."
-# capturing the plugin path + HRESULT pinpoints which plugin actually blocked the USMT
-# gather phase, which is usually far more actionable than the generic wrapper code
-# (e.g. 0x8007042B ERROR_PROCESS_ABORTED) that bubbles up from CGatherData/CDlpTask.
-GATHER_PLUGIN_FAIL_RE = re.compile(
-    r'Failure while calling IDiscovery->Gather for Plugin=\{ServerPath="([^"]+)".*?\}\.\s*Error:\s*(0x[0-9A-Fa-f]+)')
+# A migration plugin callback failing is reported on a line of the shape:
+#   "Failure while calling I<Interface>-><Callback> for Plugin={ServerPath="X\Y.dll", ...}. Error: 0x..."
+# This fires for MANY callbacks (IDiscovery->Discover, IDiscovery->Gather, IPreApply->PreApply,
+# IPostApply->ApplySuccess, ...), and the overwhelming majority of these are non-fatal: Setup logs
+# "Shell application requested ignore" (or similar) right after and moves on - some plugins fail
+# this way on every single run, thousands of times, without ever affecting the outcome. Only a
+# failure on a plugin registered as a CRITICAL ACTION actually aborts migration, and that is always
+# confirmed by a "Migration will abort" line within the next couple of lines. Capturing the plugin
+# path + callback + HRESULT for a CONFIRMED-fatal failure pinpoints what actually blocked the run,
+# which is usually far more actionable than the generic wrapper code (e.g. 0x8007042B
+# ERROR_PROCESS_ABORTED) that bubbles up from CGatherData/CDlpTask/SetupPlatform afterward.
+# Do NOT treat every regex match as fatal - that previously caused a benign, repeatedly-ignored
+# IDiscovery->Gather failure (same plugin failing to load, ~18k times across a run) to be
+# misreported as "the real blocker" while the actual critical-action failure (an IPostApply->
+# ApplySuccess timeout on a different plugin, immediately followed by "Migration will abort") was
+# missed entirely because the old regex only looked for IDiscovery->Gather.
+PLUGIN_CALLBACK_FAIL_RE = re.compile(
+    r'Failure while calling (I\w+->\w+) for Plugin=\{ServerPath="([^"]+)".*?\}\.\s*Error:\s*(0x[0-9A-Fa-f]+)')
+MIGRATION_ABORT_RE = re.compile(r'migration will abort', re.IGNORECASE)
+# how many lines after a plugin-callback failure to look for the confirming "Migration will
+# abort" before giving up and treating the failure as non-fatal/ignored
+PLUGIN_FAIL_ABORT_LOOKAHEAD = 4
+CALLBACK_LABELS = {
+    'IDiscovery->Discover': 'Discover',
+    'IDiscovery->Gather': 'Gather',
+    'IPreApply->PreApply': 'PreApply',
+    'IPostApply->PostApply': 'PostApply',
+    'IPostApply->ApplySuccess': 'ApplySuccess',
+    'IPostApply->PerUserSupport': 'PerUserSupport',
+}
 # a silence this long in setupact.log means the setup thread was blocked, not working
 SILENT_GAP_MIN = 1800
 # setupact mixes downlevel and SafeOS/WinPE sections that can run on different clocks;
@@ -392,10 +415,12 @@ def classify_path(p):
 
 def parse_setuperr_final(path):
     """Return final result code, tail sample, plugin-load-error count, last
-    'Operation failed' line (the real failing operation), any migration-plugin Gather
-    failure (which plugin DLL + HRESULT actually blocked USMT gather), and a separate
-    diag_analysis result when the last Result= line is SetupHost's own post-failure
-    diagnostic pass rather than the real install outcome."""
+    'Operation failed' line (the real failing operation), any CONFIRMED-fatal
+    migration-plugin callback failure (which plugin DLL + callback + HRESULT actually
+    aborted migration, verified via a nearby 'Migration will abort' line - not just any
+    logged-and-ignored plugin error), and a separate diag_analysis result when the last
+    Result= line is SetupHost's own post-failure diagnostic pass rather than the real
+    install outcome."""
     codes = []
     tail = []
     plugin_errors = 0
@@ -404,6 +429,9 @@ def parse_setuperr_final(path):
     diag_analysis = None
     gather_fail = None
     gather_fail_count = 0
+    # pending plugin-callback failure(s) awaiting lookahead confirmation that they were
+    # actually fatal (a "Migration will abort" line within PLUGIN_FAIL_ABORT_LOOKAHEAD lines)
+    pending = []
     if not path or not os.path.exists(path):
         return dict(final_code=None, tail=[], plugin_errors=0, op_failed=None,
                     final_ts=None, last_ts=None, diag_analysis=None, gather_fail=None)
@@ -430,10 +458,27 @@ def parse_setuperr_final(path):
                 plugin_errors += 1
             if 'operation failed:' in low:
                 op_failed_line = line
-            m = GATHER_PLUGIN_FAIL_RE.search(line)
+            # confirm or expire any pending plugin-callback failures against this line.
+            # "Migration will abort" within the lookahead window means the MOST RECENT
+            # pending candidate was the one actually registered as a critical action.
+            if pending and MIGRATION_ABORT_RE.search(line):
+                cand = pending[-1]
+                if (gather_fail and gather_fail['plugin'] == cand['plugin']
+                        and gather_fail['code'] == cand['code']
+                        and gather_fail.get('callback') == cand['callback']):
+                    gather_fail_count += 1
+                else:
+                    gather_fail_count = 1
+                gather_fail = dict(plugin=cand['plugin'], code=cand['code'],
+                                    callback=cand['callback'], ts=cand['ts'])
+                pending = []
+            elif pending:
+                for c in pending:
+                    c['age'] += 1
+                pending = [c for c in pending if c['age'] < PLUGIN_FAIL_ABORT_LOOKAHEAD]
+            m = PLUGIN_CALLBACK_FAIL_RE.search(line)
             if m:
-                gather_fail_count += 1
-                gather_fail = dict(plugin=m.group(1), code=m.group(2), ts=ts)
+                pending.append(dict(callback=m.group(1), plugin=m.group(2), code=m.group(3), ts=ts, age=0))
     if gather_fail:
         gather_fail['count'] = gather_fail_count
     final, final_ts = codes[-1] if codes else (None, None)
@@ -708,17 +753,19 @@ def build_recommendations(am, err, corr, corr_assess, diag, scan=None, incomplet
             'there is no reliable terminal result in this file. Re-collect the TSS/SetupReport once the run has actually '
             'finished (or is confirmed still stuck) rather than mid-write.')))
 
-    # -0.25) a migration plugin's Gather callback actually blocked USMT, which is almost
-    # always far more actionable than the generic wrapper code (0x8007042B etc.) that
-    # bubbles up from CGatherData/CDlpTask once the plugin's failure is treated as critical
+    # -0.25) a migration plugin callback (Gather, ApplySuccess, ...) actually blocked the
+    # migration (confirmed fatal via a "Migration will abort" line, not just any failure -
+    # most plugin-callback failures are logged and ignored), which is almost always far more
+    # actionable than the generic wrapper code (0x8007042B etc.) that bubbles up afterward
     gf = err.get('gather_fail')
     if gf:
+        cb_label = callback_label(gf.get('callback'))
         reproducible = f' It failed the <b>same way {gf["count"]}x</b> (including after a retry), so this is deterministic, not transient.' if gf.get('count', 1) > 1 else ''
         note = code_note(gf['code'])
         text = (f'<b>The real blocker is the migration plugin <code>{esc(gf["plugin"])}</code></b>, which failed its '
-                f'USMT Gather callback with <b>{esc(gf["code"])}</b>{(" (" + esc(note) + ")") if note else ""} at '
+                f'<b>{esc(cb_label)}</b> callback with <b>{esc(gf["code"])}</b>{(" (" + esc(note) + ")") if note else ""} at '
                 f'{gf["ts"]:%H:%M:%S}.{reproducible} This plugin is registered as a <b>critical action</b> '
-                '(<code>Migration will abort</code> on failure), so its failure - not the generic '
+                '(confirmed by a <code>Migration will abort</code> line right after its failure), so its failure - not the generic '
                 f'<b>{esc(fc)}</b> wrapper code that follows it - is what actually ends the run. ')
         if 'client-license-platform' in gf['plugin'].lower() or 'clipmig' in gf['plugin'].lower():
             text += (
@@ -738,6 +785,19 @@ def build_recommendations(am, err, corr, corr_assess, diag, scan=None, incomplet
                 'endpoint-protection filter drivers in the wild). If this server does not need Store/app licensing, '
                 'disabling the Client License Service before retry is a possible workaround, though with '
                 'mixed/unconfirmed results - the ACL fix above is the more targeted first step.')
+        elif 'appxupgrademigrationplugin' in gf['plugin'].lower() and gf['code'].lower() == '0x800705b4':
+            text += (
+                'This is the <b>AppX migration plugin</b> (Microsoft-Windows-AppX-Deployment-Server) timing out '
+                '(ERROR_TIMEOUT) while reconciling AppX package state for every user profile on the machine - a '
+                'documented pattern (Evergreen KB 5023344) whose stated cause is simply <b>too many user profiles '
+                'for the plugin to finish within its default per-call timeout</b>. Fix: (1) back up, then clean up '
+                'stale/unneeded user profiles to shrink the per-profile workload, and (2) extend the plugin timeout '
+                'before retrying:<br>'
+                '<code>setx /M MIG_PLUGIN_CALL_TIMEOUT_INTERVALS "60;30"</code><br>'
+                '<code>setx /M MIG_PLUGIN_CALL_TIMEOUT "180"</code><br>'
+                'Reboot and confirm both values persisted '
+                '(<code>reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" /v '
+                'MIG_PLUGIN_CALL_TIMEOUT</code>) before retrying the upgrade.')
         else:
             text += ('Search <code>~bt_Panther\\setuperr.log</code> for this plugin\'s <code>ServerPath</code> to see '
                      'its full load/discover/gather sequence and what resource it could not access.')
@@ -931,6 +991,12 @@ def detect_stall(progress, attempt_end):
 # --------------------------------------------------------------------------
 def esc(s):
     return html.escape(str(s)) if s is not None else ''
+
+def callback_label(callback):
+    """Friendly name for a migration interface callback, e.g. 'IPostApply->ApplySuccess' -> 'ApplySuccess'."""
+    if not callback:
+        return 'migration'
+    return CALLBACK_LABELS.get(callback, callback.split('->')[-1])
 
 def svg_progress(progress, attempt_start, attempt_end, stall):
     if not progress:
@@ -1355,8 +1421,9 @@ def render_html(model):
     err = m.get('err') or {}
     gf = err.get('gather_fail')
     if gf:
+        cb_label = callback_label(gf.get('callback'))
         rep = f' &mdash; failed identically <b>{gf["count"]}x</b> (deterministic, not transient).' if gf.get('count', 1) > 1 else ''
-        block_html += (f'<div class="panel bad"><b>Migration plugin Gather failure (the real blocker):</b> '
+        block_html += (f'<div class="panel bad"><b>Migration plugin {esc(cb_label)} failure (the real blocker):</b> '
                        f'<code>{esc(gf["plugin"])}</code> failed with <b>{esc(gf["code"])}</b> '
                        f'{esc(code_note(gf["code"]))} at {gf["ts"]:%H:%M:%S}.{rep} '
                        'This plugin is a critical action, so its failure - not the generic wrapper code above - is '
@@ -1871,8 +1938,9 @@ def _print_summary(model):
         print(f'   BLOCK  : compat hard block ({b["id"]}): {(b["message"] or "")[:160]}')
     gf = (model.get('err') or {}).get('gather_fail')
     if gf:
+        cb_label = callback_label(gf.get('callback'))
         rep = f' x{gf["count"]}' if gf.get('count', 1) > 1 else ''
-        print(f'   GATHER : plugin {gf["plugin"]} failed with {gf["code"]}{rep} at {gf["ts"]:%H:%M:%S} - real blocker')
+        print(f'   PLUGIN : {cb_label} on {gf["plugin"]} failed with {gf["code"]}{rep} at {gf["ts"]:%H:%M:%S} - real blocker')
     if model['final_code']:
         print(f'   final  : {model["final_code"]} {code_note(model["final_code"])}')
     else:
@@ -1953,8 +2021,9 @@ def build_verdict(am, err, corr, diag=None, stale_code=None, scan=None, incomple
                     + esc(b['message'] or '(no message text)'))
     gf = err.get('gather_fail')
     if gf:
+        cb_label = callback_label(gf.get('callback'))
         rep = f' ({gf["count"]}x, deterministic)' if gf.get('count', 1) > 1 else ''
-        bits.append(f'the migration plugin <b>{esc(gf["plugin"])}</b> failed its USMT Gather callback with '
+        bits.append(f'the migration plugin <b>{esc(gf["plugin"])}</b> failed its <b>{esc(cb_label)}</b> callback with '
                     f'<b>{esc(gf["code"])}</b>{rep} - this is the real blocker, not just the wrapper code below')
     if hang:
         extra_total = ''
