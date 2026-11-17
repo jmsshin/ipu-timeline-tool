@@ -46,6 +46,26 @@ python ipu_analyze.py path\to\setupact.log -o report.html
 a parent folder containing **multiple** `Setup_Report*` captures (produces a
 comparison page across attempts), or a single `setupact.log`.
 
+## Collecting logs manually (no TSS required)
+
+If you can't run Python directly on the affected server (e.g. an air-gapped box, or
+you just want a portable zip to hand off), use
+[`scripts/Collect-IPULogs.ps1`](scripts/Collect-IPULogs.ps1) instead. Run it elevated
+directly on the machine:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-IPULogs.ps1
+```
+
+It copies the whole Panther/Rollback/SetupDiag/CBS/DISM/Mosetup folders (not a
+hand-picked file list, so nothing relevant gets filtered out) into a single timestamped
+zip under `Downloads`, ready to feed straight into `ipu_analyze.py`. It also writes a
+`DiskSpace.txt` snapshot (free space is a common, otherwise-easy-to-miss IPU blocker)
+and flags any copy that came back short of what was actually on disk, instead of
+silently uploading an incomplete collection. The output folder/zip name and an embedded
+`CollectionInfo.txt` manifest both include the hostname and collection timestamp, so a
+batch of zips from multiple machines is never ambiguous about which one is which.
+
 ## Quickstart with a synthetic sample
 
 No log to test with? Generate a small, fully made-up sample and render it:
