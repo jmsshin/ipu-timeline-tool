@@ -16,7 +16,8 @@ Stdlib only. Usage:
   python ipu_analyze.py <tss-folder | tss.zip | setupact.log> [-o report.html] [--json model.json]
   python ipu_analyze.py --local [-o report.html]   # analyze THIS machine directly
 """
-import argparse, os, sys, re, zipfile, tempfile, shutil, glob, html, json
+import argparse, os, sys, re, zipfile, tempfile, shutil, glob, html, json, struct
+from collections import Counter
 from datetime import datetime, timedelta
 
 TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),')
@@ -183,7 +184,13 @@ NEEDED = {
     'miglog':         [rf'{DOWNLEVEL_PANTHER}[\\/]MigLog\.xml$'],
     'scanresult':     [rf'{DOWNLEVEL_PANTHER}[\\/]ScanResult\.xml$',
                         r'win_Panther[\\/]NewOs[\\/]Panther[\\/]ScanResult\.xml$'],
+    # user-profile inventory (see "user profiles" section): the collector's raw export /
+    # summary, or an offline SOFTWARE hive (e.g. from an InspectIaaSDisk collection)
+    'profilelist_reg': [r'ProfileList\.reg$'],
+    'profilelist_txt': [r'ProfileList\.txt$'],
+    'software_hive':   [r'[\\/]Windows[\\/]System32[\\/]config[\\/]SOFTWARE$'],
 }
+HIVE_ZIP_CAP = 600 * 1024 * 1024  # don't unpack an absurdly large hive from a zip
 
 def discover_from_folder(root):
     found = {}
@@ -197,6 +204,17 @@ def discover_from_folder(root):
                 # prefer the largest match (the real, most complete log)
                 if key not in found or os.path.getsize(f) > os.path.getsize(found[key]):
                     found[key] = f
+    # A loose log folder (e.g. a customer who just zipped setupact.log/setuperr.log with no
+    # ~bt_Panther structure): treat the largest unclassified setupact.log as the downlevel log.
+    if 'downlevel_act' not in found:
+        cands = [f for f in allfiles if os.path.basename(f).lower() == 'setupact.log'
+                 and not re.search(r'win_Panther|WinREAgent|DPX', f, re.IGNORECASE)]
+        if cands:
+            best = max(cands, key=os.path.getsize)
+            found['downlevel_act'] = best
+            sib = os.path.join(os.path.dirname(best), 'setuperr.log')
+            if 'downlevel_err' not in found and os.path.isfile(sib):
+                found['downlevel_err'] = sib
     return found
 
 # --------------------------------------------------------------------------
@@ -253,6 +271,8 @@ def discover_local_system(want_miglog=False):
     p = _first_readable(os.path.join(bt, 'SetupDiagResults.xml'),
                          os.path.join(os.getcwd(), 'SetupDiagResults.xml'))
     if p: found['setupdiag'] = p
+    if found and sys.platform == 'win32':
+        found['profilelist_live'] = r'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList (live)'
     return found, bt
 
 def extract_from_zip(zpath, workdir, want_miglog=False):
@@ -267,6 +287,8 @@ def extract_from_zip(zpath, workdir, want_miglog=False):
                 if any(re.search(p, nm, re.IGNORECASE) for p in pats):
                     if best is None or zi.file_size > best.file_size:
                         best = zi
+            if best is not None and key == 'software_hive' and best.file_size > HIVE_ZIP_CAP:
+                best = None
             if best is not None:
                 dest = os.path.join(workdir, key + '_' + os.path.basename(best.filename))
                 with z.open(best) as src, open(dest, 'wb') as out:
@@ -667,6 +689,411 @@ def parse_miglog(path, cap=4_000_000):
     return dict(sessions=sessions, groups=groups, roles=roles, agents=agents,
                 plugins=plugins, total_units=total_units)
 
+# --------------------------------------------------------------------------
+# user profiles (ProfileList)
+# --------------------------------------------------------------------------
+# Setup's migration (Gather/Apply) loads every user profile hive. A locked NTUSER.DAT
+# (Win32 error 32), an incomplete/orphaned profile, or a very large profile count is a
+# common reason an IPU fails (0x8007001F "Gather data") or crawls. The inventory comes
+# from, in order of preference: the live registry (--local), the collector's raw
+# ProfileList.reg export, or an offline SOFTWARE hive (e.g. InspectIaaSDisk output).
+PROFILELIST_KEY = 'Microsoft\\Windows NT\\CurrentVersion\\ProfileList'
+_FILETIME_EPOCH = datetime(1601, 1, 1)
+PROFILE_CLEANUP_DOC = 'https://learn.microsoft.com/en-us/troubleshoot/windows-server/user-profiles-and-logon/delete-user-profile'
+PROFILE_STALE_DAYS = 365
+PROFILE_MANY = 100
+
+def _filetime(v):
+    try:
+        if v and v > 0:
+            return _FILETIME_EPOCH + timedelta(microseconds=v // 10)
+    except (OverflowError, TypeError):
+        pass
+    return None
+
+def _profile_rec(sid, vals, key_last=None):
+    lo, hi = vals.get('LocalProfileLoadTimeLow'), vals.get('LocalProfileLoadTimeHigh')
+    load = _filetime((hi << 32) | lo) if isinstance(lo, int) and isinstance(hi, int) else None
+    return dict(sid=sid, path=str(vals.get('ProfileImagePath') or ''), state=vals.get('State'),
+                refcount=vals.get('RefCount'), last_load=load, key_last=key_last)
+
+class _Hive:
+    """Minimal read-only 'regf' registry hive reader (stdlib only): enough to walk keys and
+    read values. It does NOT replay the .LOG1/.LOG2 transaction logs, so a dirty hive can
+    be slightly behind the live registry (flagged via .dirty)."""
+    def __init__(self, path):
+        import mmap
+        self._fh = open(path, 'rb')
+        self.buf = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        if self.buf[:4] != b'regf':
+            self.close()
+            raise ValueError('not a registry hive (bad regf signature)')
+        self.root = struct.unpack_from('<I', self.buf, 0x24)[0]
+        s1, s2 = struct.unpack_from('<II', self.buf, 4)
+        self.dirty = s1 != s2
+
+    def close(self):
+        try:
+            self.buf.close()
+        finally:
+            self._fh.close()
+
+    def _u32(self, p): return struct.unpack_from('<I', self.buf, p)[0]
+    def _u16(self, p): return struct.unpack_from('<H', self.buf, p)[0]
+
+    def key_name(self, p):
+        flags, nl = self._u16(p + 6), self._u16(p + 76)
+        return bytes(self.buf[p + 80:p + 80 + nl]).decode('ascii' if flags & 0x20 else 'utf-16-le', 'replace')
+
+    def key_last_write(self, p):
+        return _filetime(struct.unpack_from('<Q', self.buf, p + 8)[0])
+
+    def _walk(self, off):
+        p = 0x1000 + off
+        sig, cnt = bytes(self.buf[p + 4:p + 6]), self._u16(p + 6)
+        if sig in (b'lf', b'lh'):
+            return [self._u32(p + 8 + i * 8) for i in range(cnt)]
+        if sig == b'li':
+            return [self._u32(p + 8 + i * 4) for i in range(cnt)]
+        if sig == b'ri':
+            out = []
+            for i in range(cnt):
+                out.extend(self._walk(self._u32(p + 8 + i * 4)))
+            return out
+        return []
+
+    def subkeys(self, p):
+        lst = self._u32(p + 32)
+        if self._u32(p + 24) == 0 or lst == 0xFFFFFFFF:
+            return []
+        return [0x1000 + o for o in self._walk(lst)]
+
+    def open(self, path):
+        p = 0x1000 + self.root
+        for part in path.split('\\'):
+            for c in self.subkeys(p):
+                if self.key_name(c).lower() == part.lower():
+                    p = c
+                    break
+            else:
+                return None
+        return p
+
+    def values(self, p):
+        n, lst = self._u32(p + 40), self._u32(p + 44)
+        out = {}
+        if n == 0 or lst == 0xFFFFFFFF:
+            return out
+        base = 0x1000 + lst + 4
+        for i in range(n):
+            vk = 0x1000 + self._u32(base + i * 4)
+            if bytes(self.buf[vk + 4:vk + 6]) != b'vk':
+                continue
+            nl, dl = self._u16(vk + 6), self._u32(vk + 8)
+            doff, typ, fl = self._u32(vk + 12), self._u32(vk + 16), self._u16(vk + 20)
+            name = bytes(self.buf[vk + 24:vk + 24 + nl]).decode('ascii' if fl & 1 else 'utf-16-le', 'replace')
+            if dl & 0x80000000:
+                data = struct.pack('<I', doff)[:dl & 0x7FFFFFFF]
+            else:
+                dp = 0x1000 + doff + 4
+                data = bytes(self.buf[dp:dp + dl])
+            if typ in (1, 2):
+                out[name] = data.decode('utf-16-le', 'replace').rstrip('\x00')
+            elif typ == 4 and len(data) >= 4:
+                out[name] = struct.unpack('<I', data[:4])[0]
+        return out
+
+def parse_profilelist_hive(path):
+    h = _Hive(path)
+    try:
+        k = h.open(PROFILELIST_KEY)
+        if k is None:
+            return None
+        profiles = [_profile_rec(h.key_name(c), h.values(c), h.key_last_write(c)) for c in h.subkeys(k)]
+        return dict(source='offline SOFTWARE hive', dirty=h.dirty, profiles=profiles)
+    finally:
+        h.close()
+
+_REG_KEY_RE = re.compile(r'^\[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\([^\\\]]+)\]\s*$', re.I)
+_REG_VAL_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"=(.*)$')
+
+def parse_profilelist_reg(path):
+    """Parse a 'reg export' of the ProfileList key (as written by Collect-IPULogs.ps1)."""
+    with open_text(path) as fh:
+        raw = fh.read().splitlines()
+    lines, buf = [], ''
+    for ln in raw:  # hex(2):... values wrap with a trailing backslash
+        s = ln.rstrip()
+        if s.endswith('\\') and re.search(r'=hex(\([0-9a-f]+\))?:', buf + s, re.I):
+            buf += s[:-1].lstrip() if buf else s[:-1]
+            continue
+        lines.append(buf + (s.lstrip() if buf else s))
+        buf = ''
+    profiles, sid, vals = [], None, {}
+    def flush():
+        if sid:
+            profiles.append(_profile_rec(sid, vals))
+    for ln in lines:
+        m = _REG_KEY_RE.match(ln)
+        if m:
+            flush()
+            sid, vals = m.group(1), {}
+            continue
+        if sid is None:
+            continue
+        m = _REG_VAL_RE.match(ln)
+        if not m:
+            continue
+        name, data = m.group(1).replace('\\\\', '\\'), m.group(2).strip()
+        if data.startswith('dword:'):
+            vals[name] = int(data[6:], 16)
+        elif re.match(r'hex\((1|2)\):', data, re.I):
+            bs = bytes(int(x, 16) for x in data.split(':', 1)[1].split(',') if x.strip())
+            vals[name] = bs.decode('utf-16-le', 'replace').rstrip('\x00')
+        elif data.startswith('"') and data.endswith('"'):
+            vals[name] = data[1:-1].replace('\\\\', '\\')
+    flush()
+    return dict(source='ProfileList.reg export', dirty=False, profiles=profiles) if profiles else None
+
+def parse_profilelist_live():
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 'SOFTWARE\\' + PROFILELIST_KEY)
+    except OSError:
+        return None
+    profiles = []
+    with root:
+        for i in range(winreg.QueryInfoKey(root)[0]):
+            sid = winreg.EnumKey(root, i)
+            try:
+                with winreg.OpenKey(root, sid) as k:
+                    nvals, ft = winreg.QueryInfoKey(k)[1], winreg.QueryInfoKey(k)[2]
+                    vals = {}
+                    for j in range(nvals):
+                        nm, v, _t = winreg.EnumValue(k, j)
+                        vals[nm] = v
+                profiles.append(_profile_rec(sid, vals, _filetime(ft)))
+            except OSError:
+                continue
+    return dict(source='live registry', dirty=False, profiles=profiles) if profiles else None
+
+def summarize_profiles(inv):
+    """Counts and cleanup candidates from a ProfileList inventory."""
+    ps = inv['profiles']
+    users = [p for p in ps if p['sid'].upper().startswith('S-1-5-21-')]
+    bak = [p for p in ps if p['sid'].lower().endswith('.bak')]
+    temp = [p for p in ps if re.search(r'[\\/]TEMP(\.[^\\/]+)?$', p['path'], re.I)]
+    stamp = lambda p: p['last_load'] or p['key_last']
+    stamps = [stamp(p) for p in users if stamp(p)]
+    newest = max(stamps) if stamps else None
+    stale = []
+    if newest:
+        cutoff = newest - timedelta(days=PROFILE_STALE_DAYS)
+        stale = sorted((p for p in users if stamp(p) and stamp(p) < cutoff), key=stamp)
+    drives = Counter((p['path'][:2].upper() if len(p['path']) > 1 and p['path'][1] == ':' else '(none)') for p in users)
+    return dict(total=len(ps), users=len(users), bak=bak, temp=temp, stale=stale, newest=newest,
+                drives=dict(drives), source=inv['source'], dirty=inv.get('dirty', False),
+                by_path={p['path'].lower(): p for p in ps if p['path']},
+                by_sid={p['sid'].upper(): p for p in ps})
+
+PROFILE_MAPFAIL_RE = re.compile(r'Cannot add mapping for user profile (.+?)\. Error:\s*(\d+)')
+PROFILE_INCOMPLETE_RE = re.compile(r'Incomplete user profile detected and ignored:(.+?)\. Error:\s*(\d+)')
+PROFILE_REGLOAD_RE = re.compile(r'RegLoadKey\(HKEY_USERS,(S-1-[\d-]+)[^,]*,(.+?)[\\/]NTUSER\.DAT\)\s*failed.*?\((\d+)\)\s*$')
+PROFILE_PROCESSING_RE = re.compile(r'Processing profile:\s*(.+?)\s*$')
+PROFILE_ABORT_RE = re.compile(r'User profile loading error\. Aborting', re.IGNORECASE)
+
+def parse_profile_errors(path):
+    """What setup itself said about user profiles in setupact.log: hives it could not
+    load (e.g. error 32 = locked NTUSER.DAT), incomplete profiles it skipped, and how many
+    profiles / migration passes it walked."""
+    if not path:
+        return None
+    mapfail, regload, incomplete, processed = {}, {}, {}, Counter()
+    abort = None
+    with open_text(path) as fh:
+        for line in fh:
+            if 'rofile' not in line and 'RegLoadKey' not in line:
+                continue
+            ts = parse_ts(line)
+            m = PROFILE_PROCESSING_RE.search(line)
+            if m:
+                processed[m.group(1)] += 1
+                continue
+            m = PROFILE_MAPFAIL_RE.search(line)
+            if m:
+                d = mapfail.setdefault(m.group(1), dict(code=int(m.group(2)), count=0, first=ts, last=ts))
+                d['count'] += 1
+                d['last'] = ts or d['last']
+                continue
+            m = PROFILE_REGLOAD_RE.search(line.rstrip())
+            if m:
+                d = regload.setdefault(m.group(2), dict(sid=m.group(1), code=int(m.group(3)), count=0))
+                d['count'] += 1
+                continue
+            m = PROFILE_INCOMPLETE_RE.search(line)
+            if m:
+                d = incomplete.setdefault(m.group(1), dict(code=int(m.group(2)), count=0))
+                d['count'] += 1
+                continue
+            if abort is None and PROFILE_ABORT_RE.search(line):
+                abort = ts
+    if not (mapfail or regload or incomplete or processed):
+        return None
+    passes = max(processed.values()) if processed else 0
+    return dict(mapfail=mapfail, regload=regload, incomplete=incomplete, abort=abort,
+                distinct=len(processed), passes=passes)
+
+def build_profiles(found, act_path):
+    """Combine the profile inventory (if any source exists) with setup's own profile
+    errors. Returns None when neither is available."""
+    inv = None
+    try:
+        if found.get('profilelist_live'):
+            inv = parse_profilelist_live()
+        if not inv and found.get('profilelist_reg'):
+            inv = parse_profilelist_reg(found['profilelist_reg'])
+        if not inv and found.get('software_hive'):
+            inv = parse_profilelist_hive(found['software_hive'])
+    except (OSError, ValueError, struct.error) as e:
+        print(f'    [!] could not read ProfileList: {e}', file=sys.stderr)
+    errs = parse_profile_errors(act_path)
+    if not inv and not errs:
+        return None
+    summ = summarize_profiles(inv) if inv else None
+    collector = None
+    if found.get('profilelist_txt'):
+        try:
+            with open_text(found['profilelist_txt']) as fh:
+                head = []
+                for ln in fh:
+                    if ln.startswith('Per-profile detail'):
+                        break
+                    head.append(ln.rstrip())
+            collector = '\n'.join(head).strip()
+        except OSError:
+            pass
+    return dict(inv=summ, errs=errs, collector=collector)
+
+PROFILE_ERR_NOTES = {
+    32: 'sharing violation: NTUSER.DAT is in use by another process',
+    3: 'path not found: incomplete/orphaned profile',
+    5: 'access denied',
+}
+
+def _fmt_dt(d):
+    return f'{d:%Y-%m-%d}' if d else 'unknown'
+
+def build_profile_recs(prof):
+    """Recommendations from the profile inventory + setup's own profile errors."""
+    recs = []
+    if not prof:
+        return recs
+    errs, inv = prof.get('errs'), prof.get('inv')
+    doc = f'<a href="{PROFILE_CLEANUP_DOC}">Delete a user profile</a>'
+
+    if errs and errs['mapfail']:
+        items, locked = [], False
+        for path, d in errs['mapfail'].items():
+            rec = inv and inv['by_path'].get(path.lower())
+            sid = rec['sid'] if rec else (errs['regload'].get(path) or {}).get('sid')
+            note = PROFILE_ERR_NOTES.get(d['code'], 'see Win32 error code')
+            locked = locked or d['code'] == 32
+            when = ''
+            if rec and (rec['last_load'] or rec['key_last']):
+                when = f', profile last active {_fmt_dt(rec["last_load"] or rec["key_last"])}'
+            items.append(f'<code>{esc(path)}</code>' + (f' (SID <code>{esc(sid)}</code>)' if sid else '')
+                         + f' - error {d["code"]} ({esc(note)}), {d["count"]}x{when}')
+        abort = errs.get('abort')
+        text = ('<b>Setup could not load a user profile hive:</b> ' + '; '.join(items) + '. ')
+        if abort:
+            text += (f'Setup then aborted the migration ("User profile loading error. Aborting", {abort:%H:%M:%S}), so this - not '
+                     'the generic wrapper code that follows (e.g. 0x8007001F "Gather data" / 0xC1900101) - is the real blocker. ')
+        if locked:
+            text += ('Error 32 means the profile\'s <code>NTUSER.DAT</code> is held by another process. The usual cause is the account '
+                     'that launched setup (its own logged-on profile), another logged-on/disconnected session, or a service/AV/backup '
+                     'agent running as that user. <b>Snapshot the OS disk, restart so no other users are logged in, and run setup from a '
+                     'different local admin account.</b> If the profile is not needed, remove it properly (' + doc + ') and confirm its '
+                     '<code>HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\&lt;SID&gt;</code> key is gone.')
+        else:
+            text += ('Check the profile folder and its <code>NTUSER.DAT</code> for corruption/permissions, or remove the profile if it '
+                     'is not needed (' + doc + ').')
+        recs.append(dict(prio=1 if abort else 2, text=text))
+
+    n_users = inv['users'] if inv else 0
+    distinct = errs['distinct'] if errs else 0
+    if max(n_users, distinct) > PROFILE_MANY:
+        n = max(n_users, distinct)
+        walk = (f' Setup walked <b>{distinct}</b> distinct profiles on up to <b>{errs["passes"]}</b> migration passes. ' if distinct else ' ')
+        text = (f'<b>{n} user profiles on this machine.</b>{walk}Every profile is loaded and migrated on each pass, so a very large count '
+                'slows the upgrade and raises the chance of a locked or corrupt hive. ')
+        if inv and inv['stale']:
+            sample = ', '.join(f'<code>{esc(p["path"])}</code> ({_fmt_dt(p["last_load"] or p["key_last"])})' for p in inv['stale'][:8])
+            text += (f'<b>{len(inv["stale"])}</b> profile(s) were last active more than {PROFILE_STALE_DAYS} days before the newest activity '
+                     f'(oldest first: {sample}{", ..." if len(inv["stale"]) > 8 else ""}). ')
+        text += ('Back up the <code>ProfileList</code> key (reg export), then clean up unneeded profiles (' + doc + ') before retrying.')
+        recs.append(dict(prio=2, text=text))
+
+    if inv and inv['bak']:
+        sample = ', '.join(f'<code>{esc(p["sid"])}</code>' for p in inv['bak'][:5])
+        recs.append(dict(prio=2, text=(
+            f'<b>{len(inv["bak"])} <code>ProfileList</code> key(s) end in <code>.bak</code></b> ({sample}'
+            f'{", ..." if len(inv["bak"]) > 5 else ""}): a temporary/failed-load profile left a backup key behind. After backing up the key, '
+            'delete the stale <code>.bak</code> keys (and the temp profile folder if one exists) before retrying.')))
+
+    if errs and errs['incomplete']:
+        paths = ', '.join(f'<code>{esc(p)}</code>' for p in list(errs['incomplete'])[:8])
+        recs.append(dict(prio=3, text=(
+            f'<b>Setup skipped {len(errs["incomplete"])} incomplete profile(s)</b> (no usable NTUSER.DAT): {paths}'
+            f'{", ..." if len(errs["incomplete"]) > 8 else ""}. These are ignored (not fatal) but are cleanup candidates.')))
+    return recs
+
+def render_profiles_card(prof, A, Z):
+    inv, errs, col = prof.get('inv'), prof.get('errs'), prof.get('collector')
+    rows = []
+    def row(k, v):
+        rows.append(f'<tr><td>{esc(k)}</td><td>{v}</td></tr>')
+    if inv:
+        row('Inventory source', esc(inv['source']) + (' <span class="muted">(hive was dirty: .LOG1/.LOG2 not replayed, may lag the live registry)</span>' if inv['dirty'] else ''))
+        row('ProfileList keys', f'{inv["total"]:,}')
+        row('User profiles (S-1-5-21-*)', f'{inv["users"]:,}')
+        row('Profile location', esc(', '.join(f'{k} x{v}' for k, v in sorted(inv['drives'].items()))) or '-')
+        row('Keys ending in .bak', f'{len(inv["bak"])}')
+        row('TEMP-named profiles', f'{len(inv["temp"])}')
+        row(f'Inactive for &gt;{PROFILE_STALE_DAYS} days', f'{len(inv["stale"])}')
+        row('Newest profile activity', esc(f'{inv["newest"]:%Y-%m-%d %H:%M}') if inv['newest'] else '-')
+    if errs and errs['distinct']:
+        row('Profiles setup walked', f'{errs["distinct"]:,} distinct, up to {errs["passes"]} passes')
+    body = '<table class="ref">' + ''.join(rows) + '</table>' if rows else ''
+
+    if errs and errs['mapfail']:
+        trs = ''
+        for path, d in errs['mapfail'].items():
+            rec = inv and inv['by_path'].get(path.lower())
+            sid = rec['sid'] if rec else (errs['regload'].get(path) or {}).get('sid', '')
+            span = (f'{d["first"]:%H:%M:%S} - {d["last"]:%H:%M:%S}' if d.get('first') and d.get('last') else '')
+            trs += (f'<tr><td class="mono small">{esc(path)}</td><td class="mono small">{esc(sid)}</td>'
+                    f'<td>{d["code"]} {esc(PROFILE_ERR_NOTES.get(d["code"], ""))}</td><td>{d["count"]}</td><td>{span}</td></tr>')
+        body += ('<h2 style="margin-top:12px">Profiles setup failed to load</h2><table class="ref"><tr><th>Profile</th><th>SID</th>'
+                 '<th>Error</th><th>Count</th><th>Window</th></tr>' + trs + '</table>')
+    if inv and inv['stale']:
+        trs = ''.join(f'<tr><td class="mono small">{esc(p["path"])}</td><td class="mono small">{esc(p["sid"])}</td>'
+                      f'<td>{_fmt_dt(p["last_load"] or p["key_last"])}</td></tr>' for p in inv['stale'][:15])
+        body += (f'<h2 style="margin-top:12px">Cleanup candidates (oldest {min(15, len(inv["stale"]))} of {len(inv["stale"])})</h2>'
+                 '<table class="ref"><tr><th>Profile</th><th>SID</th><th>Last activity</th></tr>' + trs + '</table>')
+    if inv and inv['bak']:
+        body += ('<h2 style="margin-top:12px">.bak keys</h2><div class="mono small">'
+                 + esc(', '.join(p['sid'] for p in inv['bak'])) + '</div>')
+    if col:
+        body += ('<h2 style="margin-top:12px">Collector summary (ProfileList.txt)</h2><pre class="mono small" style="white-space:pre-wrap">'
+                 + esc(col) + '</pre>')
+    body += ('<p class="note">Setup\'s migration loads every profile hive, so a locked NTUSER.DAT (error 32), incomplete profiles, '
+             f'.bak keys or a very large count can fail or slow an upgrade. Cleanup guide: <a href="{PROFILE_CLEANUP_DOC}">Delete a user profile</a>. '
+             'Profile "last activity" comes from LocalProfileLoadTime when present, otherwise the ProfileList key last-write time (updated on logon/logoff).</p>')
+    return A + '<h2>User profiles</h2>' + body + Z
+
 def assess_corruption(corr, err, diag=None, final_code=None):
     """Judge whether CBS corruption is a likely blocker vs benign noise.
     Honest by design: only calls 'blocker' when the failure itself is a servicing/store
@@ -724,9 +1151,10 @@ def _temp_hotspot(am):
         return (k, v, pct)
     return None
 
-def build_recommendations(am, err, corr, corr_assess, diag, scan=None, incomplete=None):
+def build_recommendations(am, err, corr, corr_assess, diag, scan=None, incomplete=None, profiles=None):
     """Rule-based 'what to try next', returned as list of dicts(prio, text)."""
     recs = []
+    recs.extend(build_profile_recs(profiles))
     fc = (err.get('final_code') or (diag or {}).get('error_code') or '')
     fcu = fc.upper().replace('0X', '0x') if fc else ''
     ext = (diag or {}).get('ext_code')
@@ -1374,6 +1802,10 @@ def render_html(model):
                      'cancelled during the downlevel/offline-apply portion. (This section fills in with the post-reboot '
                      'first-boot timeline for a TSS from an IPU that rebooted past FirstBoot.)</p>' + Z)
 
+    # user profiles (ProfileList inventory + setup's own profile errors)
+    if m.get('profiles'):
+        parts.append(render_profiles_card(m['profiles'], A, Z))
+
     # outcome (file-level)
     fc = m['final_code']
     if fc:
@@ -1838,6 +2270,7 @@ def analyze_report(found, label, attempt_sel=None, show_all=False, want_miglog=F
     diag = parse_setupdiag(found.get('setupdiag'))
     corr = parse_cbs_corruption(found.get('cbs'))
     scan = parse_scan_result(found.get('scanresult'))
+    profiles = build_profiles(found, act_path)
     primary = attempts[sel[0]]
     # A setupact.log that was exported/copied mid-write ends with a run of NUL-byte
     # padding instead of a clean final line. That means the CAPTURE is incomplete - the
@@ -1881,7 +2314,7 @@ def analyze_report(found, label, attempt_sel=None, show_all=False, want_miglog=F
                     err = dict(err, final_code=None)
     final_code = err.get('final_code') or (diag or {}).get('error_code')
     corr_assess = assess_corruption(corr, err, diag, final_code)
-    recs = build_recommendations(primary, err, corr, corr_assess, diag, scan, incomplete)
+    recs = build_recommendations(primary, err, corr, corr_assess, diag, scan, incomplete, profiles)
     verdict = build_verdict(primary, err, corr, diag, stale_code, scan, incomplete)
     online = parse_online_phase(found)
     phase_checklist = build_phase_checklist(primary, final_code, online)
@@ -1891,7 +2324,7 @@ def analyze_report(found, label, attempt_sel=None, show_all=False, want_miglog=F
         miglog = parse_miglog(found['miglog'])
     return dict(source_label=label, logs_found=found, attempts=attempts, sel_indices=sel,
                 final_code=final_code, err=err, err_tail=err['tail'], stale_code=stale_code,
-                incomplete=incomplete, scan=scan,
+                incomplete=incomplete, scan=scan, profiles=profiles,
                 setupdiag=diag, corruption=corr, corr_assess=corr_assess,
                 recommendations=recs, verdict=verdict, report_date=report_date(label),
                 online=online, phase_checklist=phase_checklist, miglog=miglog)
@@ -1952,9 +2385,30 @@ def _print_summary(model):
         else:
             extra = ''
         print(f'   final  : none - no terminal result code{extra}')
+    pr = model.get('profiles') or {}
+    if pr.get('inv'):
+        iv = pr['inv']
+        print(f'   PROFILES: {iv["users"]} user profile(s) ({iv["source"]}), {len(iv["bak"])} .bak, {len(iv["stale"])} inactive >{PROFILE_STALE_DAYS}d')
+    for path, d in ((pr.get('errs') or {}).get('mapfail') or {}).items():
+        print(f'   PROFILE: setup could not load {path} (error {d["code"]}, {d["count"]}x)')
     if corr: print(f'   CBS    : det {corr.get("detected")}, rep {corr.get("repaired")}, {corr.get("hr")} -> {model["corr_assess"][0] if model["corr_assess"] else "n/a"}')
     if model['recommendations']:
         print('   next   : ' + re.sub('<[^>]+>', '', model['recommendations'][0]['text'])[:120])
+
+def _profiles_json(prof):
+    if not prof:
+        return None
+    iv, er = prof.get('inv'), prof.get('errs') or {}
+    out = {}
+    if iv:
+        out['inventory'] = dict(source=iv['source'], total=iv['total'], users=iv['users'], bak=[p['sid'] for p in iv['bak']],
+                                temp=[p['path'] for p in iv['temp']], stale=len(iv['stale']), drives=iv['drives'],
+                                newest=str(iv['newest']) if iv['newest'] else None, dirty=iv['dirty'])
+    if er:
+        out['setup'] = dict(distinct_walked=er.get('distinct'), passes=er.get('passes'), abort=str(er['abort']) if er.get('abort') else None,
+                            load_failures={p: dict(code=d['code'], count=d['count']) for p, d in er['mapfail'].items()},
+                            incomplete=list(er['incomplete']))
+    return out
 
 def analyze(inp, out_html, out_json=None, attempt_sel=None, show_all=False, want_miglog=False, local=False):
     workdir = None
@@ -2001,6 +2455,7 @@ def analyze(inp, out_html, out_json=None, attempt_sel=None, show_all=False, want
             jm = [dict(label=m['source_label'], date=str(m['report_date']), final=m.get('final_code'),
                        incomplete=m.get('incomplete'), hard_blocks=(m.get('scan') or {}).get('hard_blocks'),
                        gather_fail=(m.get('err') or {}).get('gather_fail'), corr=m.get('corruption'),
+                       profiles=_profiles_json(m.get('profiles')),
                        phases=m.get('phase_checklist', []),
                        recs=[r['text'] for r in m.get('recommendations', [])]) for m in models]
             with open(out_json, 'w', encoding='utf-8') as f:

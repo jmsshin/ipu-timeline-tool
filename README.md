@@ -120,8 +120,14 @@ browser to see what a report looks like.)
     the generic wrapper error code that follows it), and an intentionally honest
     **CBS corruption assessment** (NOISE / RELEVANT / BLOCKER). It will not
     overstate corruption as *the* cause from logs alone.
-12. **Which logs to check**: a short IPU log cheat-sheet.
-13. **No-IPU / incomplete-capture detection**: if the logs show no in-place upgrade
+12. **User profiles**: a ProfileList inventory (live registry with `--local`, the
+    collector's `ProfileList.reg`, or an offline `SOFTWARE` hive such as an
+    InspectIaaSDisk collection) combined with setup's own profile errors. Flags a
+    profile hive setup could not load (e.g. error 32 = locked `NTUSER.DAT`, the
+    real blocker behind a `0x8007001F` "Gather data" failure), `.bak` keys,
+    incomplete profiles and very large/stale profile counts, with cleanup guidance.
+13. **Which logs to check**: a short IPU log cheat-sheet.
+14. **No-IPU / incomplete-capture detection**: if the logs show no in-place upgrade
     ever ran, or the capture was cut off mid-write (a long run of NUL padding at EOF),
     the report says so plainly instead of guessing or fabricating a final result.
 
