@@ -60,8 +60,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Collect-IPULogs.ps1
 It copies the whole Panther/Rollback/SetupDiag/CBS/DISM/Mosetup folders (not a
 hand-picked file list, so nothing relevant gets filtered out) into a single timestamped
 zip under `Downloads`, ready to feed straight into `ipu_analyze.py`. It also writes a
-`DiskSpace.txt` snapshot (free space is a common, otherwise-easy-to-miss IPU blocker)
-and flags any copy that came back short of what was actually on disk, instead of
+`DiskSpace.txt` snapshot (free space is a common, otherwise-easy-to-miss IPU blocker),
+a user-profile inventory (`ProfileList.txt` plus a raw `ProfileList.reg` backup; a
+locked `NTUSER.DAT`, incomplete or `.bak` profiles, or thousands of profiles can fail
+or slow the migration), and flags any copy that came back short of what was actually on disk, instead of
 silently uploading an incomplete collection. The output folder/zip name and an embedded
 `CollectionInfo.txt` manifest both include the hostname and collection timestamp, so a
 batch of zips from multiple machines is never ambiguous about which one is which.

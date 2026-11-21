@@ -29,6 +29,15 @@
                                A disk-space shortfall during Pre-Finalize is one of the
                                most common IPU failure causes and is otherwise invisible
                                until someone reads thousands of setupact.log lines.
+      - ProfileList.txt / ProfileList.reg - user profile inventory from
+                               HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList
+                               (SID, path, folder/NTUSER.DAT present, State, RefCount, key
+                               last-write, hive currently loaded, .bak keys, orphan folders,
+                               signed-in sessions) plus a raw .reg export that doubles as a
+                               backup. Setup's migration loads every profile hive, so a locked
+                               NTUSER.DAT (error 32), incomplete profiles, or a huge profile
+                               count are common causes of a failed or very slow IPU. Notable
+                               findings are also added to CollectionWarnings.txt.
       - CollectionWarnings.txt - populated ONLY if a copy encountered errors or the
                                destination ended up with fewer files than the source
                                (e.g. a security product intercepting/quarantining files
@@ -211,6 +220,103 @@ $InfoLines = @(
     "OS version      : $($OsInfo.ProductName) (build $($OsInfo.CurrentBuildNumber).$($OsInfo.UBR))"
 )
 $InfoLines -join "`r`n" | Out-File -LiteralPath (Join-Path $DestRoot 'CollectionInfo.txt') -Encoding utf8
+
+# ---- User profile inventory. Setup's migration (Gather) loads every profile hive; a
+# locked NTUSER.DAT (Win32 error 32), an incomplete profile, or a very large profile
+# count makes the IPU fail or crawl. Also exports the ProfileList key as a ready-made
+# registry backup. Everything here is read-only. ----
+try {
+    $ProfileRegPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    & reg.exe export "HKLM\$ProfileRegPath" (Join-Path $DestRoot 'ProfileList.reg') /y 2>&1 | Out-Null
+
+    Add-Type -Namespace IPU -Name RegTime -ErrorAction Stop -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+public static extern int RegQueryInfoKey(IntPtr hKey, IntPtr cls, IntPtr clsLen, IntPtr reserved,
+    IntPtr subKeys, IntPtr maxSubKey, IntPtr maxClass, IntPtr values, IntPtr maxValueName,
+    IntPtr maxValueData, IntPtr secDesc, out long lastWrite);
+'@
+
+    $plRoot = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($ProfileRegPath)
+    $loadedSids = @(Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.PSChildName } | Where-Object { $_ -notlike '*_Classes' })
+    $meSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
+    $Profiles = foreach ($sid in $plRoot.GetSubKeyNames()) {
+        $k = $plRoot.OpenSubKey($sid)
+        $raw = $k.GetValue('ProfileImagePath', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $path = [Environment]::ExpandEnvironmentVariables([string]$raw)
+        $ft = [long]0
+        $lastWrite = ''
+        if ([IPU.RegTime]::RegQueryInfoKey($k.Handle.DangerousGetHandle(), [IntPtr]::Zero, [IntPtr]::Zero,
+                [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero,
+                [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$ft) -eq 0 -and $ft -gt 0) {
+            $lastWrite = [DateTime]::FromFileTimeUtc($ft).ToString('yyyy-MM-dd HH:mm')
+        }
+        [pscustomobject]@{
+            SID          = $sid
+            ProfilePath  = $path
+            FolderExists = [bool]($path -and (Test-Path -LiteralPath $path))
+            NtUserDat    = [bool]($path -and (Test-Path -LiteralPath (Join-Path $path 'NTUSER.DAT')))
+            State        = $k.GetValue('State')
+            RefCount     = $k.GetValue('RefCount')
+            HiveLoaded   = ($loadedSids -contains $sid.Replace('.bak', ''))
+            RunAsUser    = ($sid -eq $meSid)
+            KeyLastWrite = $lastWrite
+        }
+        $k.Close()
+    }
+    $plRoot.Close()
+
+    $UserProfiles = @($Profiles | Where-Object { $_.SID -like 'S-1-5-21-*' })
+    $BakKeys      = @($Profiles | Where-Object { $_.SID -like '*.bak' })
+    $MissingDirs  = @($UserProfiles | Where-Object { -not $_.FolderExists })
+    $NoHive       = @($UserProfiles | Where-Object { $_.FolderExists -and -not $_.NtUserDat })
+    $OtherLoaded  = @($UserProfiles | Where-Object { $_.HiveLoaded -and -not $_.RunAsUser })
+
+    # Folders under the profile root that no ProfileList key points to (orphans).
+    $known = $Profiles | ForEach-Object { Split-Path $_.ProfilePath -Leaf }
+    $skip  = 'Public', 'Default', 'Default User', 'All Users', 'desktop.ini'
+    $Orphans = @(Get-ChildItem (Join-Path $env:SystemDrive 'Users') -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $skip -notcontains $_.Name -and $known -notcontains $_.Name } |
+        ForEach-Object { $_.Name })
+
+    $pl = New-Object System.Collections.Generic.List[string]
+    $pl.Add("User profile inventory - $($StampLocal.ToString('yyyy-MM-dd HH:mm:ss zzz'))")
+    $pl.Add("Source: HKLM\$ProfileRegPath  (raw export: ProfileList.reg)")
+    $pl.Add('')
+    $pl.Add("  ProfileList keys total        : $($Profiles.Count)")
+    $pl.Add("  User (S-1-5-21-*) profiles    : $($UserProfiles.Count)")
+    $pl.Add("  Keys ending in .bak           : $($BakKeys.Count)")
+    $pl.Add("  Profile folder missing        : $($MissingDirs.Count)")
+    $pl.Add("  Folder present, no NTUSER.DAT : $($NoHive.Count)")
+    $pl.Add("  Orphan folders (no key)       : $($Orphans.Count)")
+    $pl.Add("  Hives loaded now (other users): $($OtherLoaded.Count)")
+    $pl.Add("  Run-as account SID            : $meSid")
+    $pl.Add('')
+    $pl.Add('Signed-in sessions (query user):')
+    $pl.Add(((& query.exe user 2>&1 | Out-String).TrimEnd()))
+    $pl.Add('')
+    if ($Orphans.Count -gt 0) { $pl.Add("Orphan folders: $($Orphans -join ', ')"); $pl.Add('') }
+    $pl.Add('Per-profile detail (sorted by key last-write; HiveLoaded/RunAsUser = currently in use):')
+    $pl.Add(($Profiles | Sort-Object KeyLastWrite | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd())
+    $pl -join "`r`n" | Out-File -LiteralPath (Join-Path $DestRoot 'ProfileList.txt') -Encoding utf8
+
+    if ($BakKeys.Count -gt 0) {
+        $Warnings.Add("ProfileList: $($BakKeys.Count) key(s) end in .bak (temp/backup profiles): $(($BakKeys.SID) -join ', ')")
+    }
+    if ($OtherLoaded.Count -gt 0) {
+        $Warnings.Add("ProfileList: $($OtherLoaded.Count) other user hive(s) loaded at collection time (a locked NTUSER.DAT can fail the migration with error 32): $(($OtherLoaded.ProfilePath) -join ', ')")
+    }
+    if ($NoHive.Count -gt 0 -or $MissingDirs.Count -gt 0) {
+        $Warnings.Add("ProfileList: $($NoHive.Count) profile(s) without NTUSER.DAT and $($MissingDirs.Count) key(s) with a missing folder (incomplete/orphaned profiles) - see ProfileList.txt.")
+    }
+    if ($UserProfiles.Count -gt 100) {
+        $Warnings.Add("ProfileList: $($UserProfiles.Count) user profiles. Setup's migration walks every profile on each pass, so a very large count slows the upgrade and raises the chance of a locked/corrupt hive; consider cleaning up unused profiles.")
+    }
+}
+catch {
+    $Warnings.Add("ProfileList inventory failed: $($_.Exception.Message)")
+}
 
 if ($Warnings.Count -gt 0) {
     $Warnings -join "`r`n" | Out-File -LiteralPath (Join-Path $DestRoot 'CollectionWarnings.txt') -Encoding utf8
